@@ -7,6 +7,8 @@ from pydantic import BaseModel
 
 load_dotenv()
 
+from app.agent import root_agent
+
 APP_NAME = "adk_fastapi_demo"
 
 session_service = InMemorySessionService()
