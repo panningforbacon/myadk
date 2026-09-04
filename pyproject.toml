@@ -1,0 +1,32 @@
+[project]
+name = "myadk"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "fastapi>=0.141.1",
+    "google-adk>=2.8.0",
+    "hypercorn>=0.18.0",
+    "python-dotenv>=1.2.3",
+]
+
+[dependency-groups]
+dev = [
+    "pyright>=1.1.411",
+    "pytest>=9.1.1",
+    "ruff>=0.16.6",
+]
+
+[tool.ruff]
+line-length = 600
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "UP"]
+unfixable = ["F401"]
+
+[tool.pyright]
+typeCheckingMode = "basic"  # "off", "basic", "standard", "strict"include = ["src"]
+pythonVersion = "3.14"
+pythonPlatform = "All"
