@@ -12,3 +12,5 @@ wheels/
 # dotenv
 .env
 
+# sqlite
+*.db

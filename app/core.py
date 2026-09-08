@@ -12,8 +12,12 @@ from app.agent import root_agent
 
 APP_NAME = "adk_fastapi_demo"
 
+session_service = InMemorySessionService()
+runner = Runner(app_name=APP_NAME, agent=root_agent, session_service=session_service)
 
-class SessionNotFoundError(Exception): ...
+
+class SessionNotFoundError(Exception):
+    """Raised for any operation against a user_id/session_id pair that doesn't exist."""
 
 
 @dataclass
@@ -22,8 +26,10 @@ class SessionInfo:
     last_update_time: float
 
 
-session_service = InMemorySessionService()
-runner = Runner(app_name=APP_NAME, agent=root_agent, session_service=session_service)
+@dataclass
+class Turn:
+    role: str  # "user" | "assistant"
+    text: str
 
 
 async def create_session(user_id: str) -> str:
@@ -41,6 +47,26 @@ async def delete_session(user_id: str, session_id: str) -> None:  # raises Sessi
     if session is None:
         raise SessionNotFoundError(f"no session {session_id!r} for user {user_id!r}")
     await session_service.delete_session(app_name=APP_NAME, user_id=user_id, session_id=session_id)
+
+
+async def get_transcript(user_id: str, session_id: str) -> list[Turn]:
+    session = await session_service.get_session(app_name=APP_NAME, user_id=user_id, session_id=session_id)
+    if session is None:
+        raise SessionNotFoundError(f"no session {session_id!r} for user {user_id!r}")
+
+    turns = []
+    for event in session.events:
+        if not (event.author == "user" or event.is_final_response()):
+            continue
+        if not (event.content and event.content.parts):
+            continue
+        text = event.content.parts[0].text
+        if not text:
+            continue
+        role = "user" if event.author == "user" else "assistant"
+        turns.append(Turn(role=role, text=text))
+
+    return turns
 
 
 async def send_message(user_id: str, session_id: str, message: str) -> str:  # raises SessionNotFoundError

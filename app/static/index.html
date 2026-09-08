@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ADK demo</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+
+  <!-- AUTH VIEW: login and register share one view, toggled by a link -->
+  <main id="auth-view" hidden>
+    <h1>ADK demo</h1>
+
+    <form id="login-form">
+      <h2>Sign in</h2>
+      <label>Email <input type="email" name="email" required autocomplete="username" /></label>
+      <label>Password <input type="password" name="password" required autocomplete="current-password" /></label>
+      <button type="submit">Sign in</button>
+      <p class="error" id="login-error"></p>
+    </form>
+
+    <form id="register-form" hidden>
+      <h2>Create account</h2>
+      <label>Email <input type="email" name="email" required autocomplete="username" /></label>
+      <label>Password <input type="password" name="password" required autocomplete="new-password" /></label>
+      <button type="submit">Create account</button>
+      <p class="error" id="register-error"></p>
+    </form>
+
+    <p>
+      <a href="#" id="show-register">Need an account?</a>
+      <a href="#" id="show-login" hidden>Have an account?</a>
+    </p>
+  </main>
+
+  <!-- CHAT VIEW: history + input box; empty history === the "empty session" state -->
+  <main id="chat-view" hidden>
+    <header>
+      <span id="session-label"></span>
+      <button id="logout-button">Log out</button>
+    </header>
+
+    <div id="transcript" aria-live="polite"></div>
+
+    <form id="chat-form">
+      <textarea id="chat-input" rows="4" placeholder="Say something…" required></textarea>
+      <button type="submit">Send</button>
+    </form>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>
