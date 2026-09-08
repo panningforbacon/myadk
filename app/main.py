@@ -1,6 +1,7 @@
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -98,6 +99,16 @@ async def chat(req: ChatRequest, user: User = Depends(current_active_user)) -> C
     except core.SessionNotFoundError as err:
         raise HTTPException(status_code=404, detail="session_not_found") from err
     return ChatResponse(response=response)
+
+
+@app.post("/chat/stream")
+async def chat_stream(req: ChatRequest, user: User = Depends(current_active_user)):
+    if not await core.session_exists(str(user.id), req.session_id):
+        raise HTTPException(status_code=404, detail="session not found")
+    return StreamingResponse(
+        core.stream_message(str(user.id), req.session_id, req.message),
+        media_type="text/plain",
+    )
 
 
 # Mounted last: Starlette matches routes in registration order, so every

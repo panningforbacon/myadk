@@ -13,6 +13,7 @@ function addTurn(role, text) {
   el.textContent = text;
   $("transcript").appendChild(el);
   el.scrollIntoView({ block: "end" });
+  return el;
 }
 
 // --- auth view: login/register toggle -------------------------------------
@@ -162,7 +163,7 @@ $("chat-form").addEventListener("submit", async (e) => {
   input.disabled = true;
 
   try {
-    const res = await fetch("/chat", {
+    const res = await fetch("/chat/stream", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ session_id: currentSessionId, message }),
@@ -172,8 +173,16 @@ $("chat-form").addEventListener("submit", async (e) => {
       console.error(await res.text());
       return;
     }
-    const { response } = await res.json();
-    addTurn("assistant", response);
+
+    const bubble = addTurn("assistant", "");
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      bubble.textContent += decoder.decode(value, { stream: true });
+      bubble.scrollIntoView({ block: "end" });
+    }
   } finally {
     input.disabled = false;
     input.focus();

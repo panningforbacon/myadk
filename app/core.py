@@ -4,6 +4,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+from google.adk.agents.run_config import RunConfig, StreamingMode
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 from google.genai import types
@@ -69,16 +70,35 @@ async def get_transcript(user_id: str, session_id: str) -> list[Turn]:
     return turns
 
 
-async def send_message(user_id: str, session_id: str, message: str) -> str:  # raises SessionNotFoundError
+async def session_exists(user_id: str, session_id: str) -> bool:
+    session = await session_service.get_session(app_name=APP_NAME, user_id=user_id, session_id=session_id)
+    return session is not None
+
+
+async def stream_message(user_id: str, session_id: str, message: str):
     session = await session_service.get_session(app_name=APP_NAME, user_id=user_id, session_id=session_id)
     if session is None:
         raise SessionNotFoundError(f"no session {session_id!r} for user {user_id!r}")
 
     user_message = types.Content(role="user", parts=[types.Part(text=message)])
+    run_config = RunConfig(streaming_mode=StreamingMode.SSE)
 
-    final_text = ""
-    async for event in runner.run_async(user_id=user_id, session_id=session_id, new_message=user_message):
-        if event.is_final_response() and event.content and event.content.parts:
-            final_text = event.content.parts[0].text or ""
+    yielded_any = False
+    final_event = None
+    async for event in runner.run_async(user_id=user_id, session_id=session_id, new_message=user_message, run_config=run_config):
+        if event.partial and event.content and event.content.parts:
+            text = event.content.parts[0].text
+            if text:
+                yielded_any = True
+                yield text
+            elif event.is_final_response():
+                final_event = event
 
-    return final_text
+        if not yielded_any and final_event and final_event.content and final_event.content.parts:
+            text = final_event.content.parts[0].text
+            if text:
+                yield text
+
+
+async def send_message(user_id: str, session_id: str, message: str) -> str:
+    return "".joint([chunk async for chunk in stream_message(user_id, session_id, message)])
