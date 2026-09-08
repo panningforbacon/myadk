@@ -101,4 +101,4 @@ async def stream_message(user_id: str, session_id: str, message: str):
 
 
 async def send_message(user_id: str, session_id: str, message: str) -> str:
-    return "".joint([chunk async for chunk in stream_message(user_id, session_id, message)])
+    return "".join([chunk async for chunk in stream_message(user_id, session_id, message)])
