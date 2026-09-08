@@ -100,5 +100,20 @@ async def stream_message(user_id: str, session_id: str, message: str):
                 yield text
 
 
-async def send_message(user_id: str, session_id: str, message: str) -> str:
-    return "".join([chunk async for chunk in stream_message(user_id, session_id, message)])
+# async def send_message(user_id: str, session_id: str, message: str) -> str:
+#     return "".join([chunk async for chunk in stream_message(user_id, session_id, message)])
+
+
+async def send_message(user_id: str, session_id: str, message: str) -> str:  # raises SessionNotFoundError
+    session = await session_service.get_session(app_name=APP_NAME, user_id=user_id, session_id=session_id)
+    if session is None:
+        raise SessionNotFoundError(f"no session {session_id!r} for user {user_id!r}")
+
+    user_message = types.Content(role="user", parts=[types.Part(text=message)])
+
+    final_text = ""
+    async for event in runner.run_async(user_id=user_id, session_id=session_id, new_message=user_message):
+        if event.is_final_response() and event.content and event.content.parts:
+            final_text = event.content.parts[0].text or ""
+
+    return final_text
