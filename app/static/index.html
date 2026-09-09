@@ -34,19 +34,27 @@
     </p>
   </main>
 
-  <!-- CHAT VIEW: history + input box; empty history === the "empty session" state -->
+  <!-- CHAT VIEW: sidebar (session picker) + chat pane. Empty transcript in
+       the pane is the "empty session" state; a non-empty one shows history. -->
   <main id="chat-view" hidden>
-    <header>
-      <span id="session-label"></span>
-      <button id="logout-button">Log out</button>
-    </header>
+    <aside id="sidebar">
+      <button id="new-chat-button">+ New chat</button>
+      <ul id="session-list"></ul>
+    </aside>
 
-    <div id="transcript" aria-live="polite"></div>
+    <section id="chat-pane">
+      <header>
+        <span id="session-label"></span>
+        <button id="logout-button">Log out</button>
+      </header>
 
-    <form id="chat-form">
-      <textarea id="chat-input" rows="4" placeholder="Say something…" required></textarea>
-      <button type="submit">Send</button>
-    </form>
+      <div id="transcript" aria-live="polite"></div>
+
+      <form id="chat-form">
+        <textarea id="chat-input" rows="4" placeholder="Say something…" required></textarea>
+        <button type="submit">Send</button>
+      </form>
+    </section>
   </main>
 
   <script src="/app.js"></script>

@@ -9,10 +9,10 @@
 8. Add streaming responses
 9. Reverted 'send_message()', no longer a thin wrapper of 'stream_message()'
 10. Replace InMemorySessionService with DatabaseSessionService
+11. Multi-session management -- list, open, rename, delete
 
 
 # Backlog
-- Multi-session management (list/rename/delete)
 - Email verification of registrations
 - Password reset functionality
 - Superuser: Optionally view all users and access their sessions (as read-only)

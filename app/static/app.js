@@ -84,6 +84,7 @@ $("logout-button").addEventListener("click", async () => {
   await fetch("/auth/logout", { method: "POST" });
   currentSessionId = null;
   $("transcript").innerHTML = "";
+  $("session-list").innerHTML = "";
   showView("auth");
 });
 
@@ -141,7 +142,122 @@ async function showChatFor(sessionId) {
   currentSessionId = sessionId;
   $("session-label").textContent = `session ${sessionId.slice(0, 8)}`;
   showView("chat");
+  await refreshSidebar();
 }
+
+// --- sidebar: session picker (list, new chat, rename, delete) --------------
+
+let sidebarSessions = [];
+
+function renderSidebar(sessions) {
+  sessions.sort((a, b) => b.last_update_time - a.last_update_time);
+  sidebarSessions = sessions;
+  const list = $("session-list");
+  list.innerHTML = "";
+
+  for (const session of sessions) {
+    const li = document.createElement("li");
+    li.className = "session-item" + (session.session_id === currentSessionId ? " active" : "");
+
+    const titleEl = document.createElement("span");
+    titleEl.className = "title";
+    titleEl.textContent = session.title || "Untitled";
+    titleEl.title = session.title || "Untitled"; // full text on hover, since it's ellipsized
+    titleEl.addEventListener("click", () => showChatFor(session.session_id));
+
+    const renameBtn = document.createElement("button");
+    renameBtn.className = "icon-button";
+    renameBtn.type = "button";
+    renameBtn.textContent = "✎";
+    renameBtn.title = "Rename";
+    renameBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      startRename(li, titleEl, session);
+    });
+
+    const deleteBtn = document.createElement("button");
+    deleteBtn.className = "icon-button";
+    deleteBtn.type = "button";
+    deleteBtn.textContent = "✕";
+    deleteBtn.title = "Delete";
+    deleteBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      deleteSessionFromSidebar(session.session_id);
+    });
+
+    li.append(titleEl, renameBtn, deleteBtn);
+    list.appendChild(li);
+  }
+}
+
+function startRename(li, titleEl, session) {
+  const input = document.createElement("input");
+  input.className = "title-input";
+  input.value = session.title || "";
+  input.placeholder = "New chat";
+
+  const commit = async () => {
+    const newTitle = input.value.trim();
+    input.removeEventListener("blur", commit);
+    if (newTitle && newTitle !== session.title) {
+      await fetch(`/sessions/${session.session_id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title: newTitle }),
+      });
+    }
+    await refreshSidebar();
+  };
+
+  input.addEventListener("blur", commit);
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") input.blur();
+    if (e.key === "Escape") { input.removeEventListener("blur", commit); refreshSidebar(); }
+  });
+
+  li.replaceChild(input, titleEl);
+  input.focus();
+  input.select();
+}
+
+async function deleteSessionFromSidebar(sessionId) {
+  if (!confirm("Delete this session? This can't be undone.")) return;
+  await fetch(`/sessions/${sessionId}`, { method: "DELETE" });
+
+  if (sessionId === currentSessionId) {
+    // Same fallback as everywhere else: most recent remaining, or a fresh
+    // session if none are left -- resolveSession() already encodes exactly
+    // that policy, no new logic needed here.
+    await showChatFor(await resolveSession());
+  } else {
+    await refreshSidebar();
+  }
+}
+
+function updateSidebarTitle(sessionId, title) {
+  // No refetch -- the title request's own response already has the answer.
+  // Mutate the in-memory list renderSidebar last drew from and redraw.
+  const match = sidebarSessions.find((s) => s.session_id === sessionId);
+  if (match) {
+    match.title = title;
+    renderSidebar(sidebarSessions);
+  }
+}
+
+async function refreshSidebar() {
+  const res = await fetch("/sessions");
+  if (!res.ok) return;
+  const { sessions } = await res.json();
+  renderSidebar(sessions);
+}
+
+$("new-chat-button").addEventListener("click", async () => {
+  // Deliberately bypasses resolveSession()'s "resume most recent" policy --
+  // this button's entire purpose is to *not* resume anything.
+  const res = await fetch("/sessions", { method: "POST" });
+  const { session_id } = await res.json();
+  await showChatFor(session_id);
+});
 
 async function enterChat() {
   try {
@@ -158,15 +274,37 @@ $("chat-form").addEventListener("submit", async (e) => {
   const message = input.value.trim();
   if (!message) return;
 
+  // Cheap client-side proxy for "is this the session's first turn": an empty
+  // transcript before this send means it is -- the only case worth firing
+  // the title request for at all.
+  const isFirstTurn = $("transcript").children.length === 0;
+  const sessionId = currentSessionId; // captured now, not read again later --
+  // if the user switches sessions while this is in flight, currentSessionId
+  // may have moved on by the time these promises resolve.
+
   addTurn("user", message);
   input.value = "";
   input.disabled = true;
+
+  if (isFirstTurn) {
+    // Independent of the chat call below: not awaited here, not sequenced
+    // before or after it. Its own response updates the sidebar directly
+    // when it resolves; if it's slow or fails, the chat reply is unaffected.
+    fetch(`/sessions/${sessionId}/title`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message }),
+    })
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => { if (data) updateSidebarTitle(sessionId, data.title); })
+      .catch((err) => console.error("title generation failed:", err));
+  }
 
   try {
     const res = await fetch("/chat/stream", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ session_id: currentSessionId, message }),
+      body: JSON.stringify({ session_id: sessionId, message }),
     });
     if (!res.ok) {
       addTurn("assistant", "(error -- see console)");

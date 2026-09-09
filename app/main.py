@@ -44,10 +44,23 @@ class SessionResponse(BaseModel):
 class SessionSummary(BaseModel):
     session_id: str
     last_update_time: float
+    title: str | None
 
 
 class ListSessionsResponse(BaseModel):
     sessions: list[SessionSummary]
+
+
+class RenameSessionRequest(BaseModel):
+    title: str
+
+
+class TitleRequest(BaseModel):
+    message: str
+
+
+class TitleResponse(BaseModel):
+    title: str
 
 
 class TurnOut(BaseModel):
@@ -73,7 +86,7 @@ async def create_session(user: User = Depends(current_active_user)) -> SessionRe
 @app.get("/sessions", response_model=ListSessionsResponse)
 async def list_sessions(user: User = Depends(current_active_user)) -> ListSessionsResponse:
     sessions = await core.list_sessions(str(user.id))
-    return ListSessionsResponse(sessions=[SessionSummary(session_id=s.session_id, last_update_time=s.last_update_time) for s in sessions])
+    return ListSessionsResponse(sessions=[SessionSummary(session_id=s.session_id, last_update_time=s.last_update_time, title=s.title) for s in sessions])
 
 
 @app.delete("/sessions/{session_id}", status_code=204)
@@ -84,7 +97,15 @@ async def delete_session(session_id: str, user: User = Depends(current_active_us
         raise HTTPException(status_code=404, detail="session not found") from err
 
 
-@app.get("/sessions/{session_id}/message", response_model=TranscriptResponse)
+@app.patch("/sessions/{session_id}", status_code=204)
+async def rename_session(session_id: str, req: RenameSessionRequest, user: User = Depends(current_active_user)) -> None:
+    try:
+        await core.rename_session(str(user.id), session_id, req.title)
+    except core.SessionNotFoundError as err:
+        raise HTTPException(status_code=404, detail="session not found") from err
+
+
+@app.get("/sessions/{session_id}/messages", response_model=TranscriptResponse)
 async def get_transcript(session_id: str, user: User = Depends(current_active_user)) -> TranscriptResponse:
     try:
         turns = await core.get_transcript(str(user.id), session_id)
@@ -110,6 +131,15 @@ async def chat_stream(req: ChatRequest, user: User = Depends(current_active_user
         core.stream_message(str(user.id), req.session_id, req.message),
         media_type="text/plain",
     )
+
+
+@app.post("/sessions/{session_id}/title", response_model=TitleResponse)
+async def generate_session_title(session_id: str, req: TitleRequest, user: User = Depends(current_active_user)) -> TitleResponse:
+    try:
+        title = await core.maybe_generate_title(str(user.id), session_id, req.message)
+    except core.SessionNotFoundError as err:
+        raise HTTPException(status_code=404, detail="session not found") from err
+    return TitleResponse(title=title)
 
 
 # Mounted last: Starlette matches routes in registration order, so every

@@ -1,102 +1,93 @@
-* {
-    box-sizing: border-box;
-}
+* { box-sizing: border-box; }
 
-[hidden] {
-    display: none !important;
+[hidden] { display: none; }
+
+html, body {
+  height: 100%;
+  margin: 0;
 }
 
 body {
-    font-family: system-ui, sans-serif;
-    max-width: 640px;
-    margin: 2rem auto;
-    padding: 0 1rem;
-    color: #1a1a1a;
+  font-family: system-ui, sans-serif;
+  color: #1a1a1a;
 }
 
-form {
-    display: flex;
-    flex-direction: column;
-    gap: 0.5rem;
-    max-width: 320px;
+#auth-view {
+  max-width: 400px;
+  margin: 2rem auto;
+  padding: 0 1rem;
 }
 
-label {
-    display: flex;
-    flex-direction: column;
-    gap: 0.25rem;
-    font-size: 0.9rem;
+form { display: flex; flex-direction: column; gap: 0.5rem; max-width: 320px; }
+label { display: flex; flex-direction: column; gap: 0.25rem; font-size: 0.9rem; }
+input, textarea { font: inherit; padding: 0.5rem; border: 1px solid #ccc; border-radius: 4px; }
+button { font: inherit; padding: 0.5rem 1rem; border: 1px solid #333; border-radius: 4px; background: #fff; cursor: pointer; }
+button:hover { background: #f0f0f0; }
+.error { color: #b00020; min-height: 1.2em; font-size: 0.9rem; }
+
+#chat-view:not([hidden]) { display: flex; height: 100%; }
+/* :not([hidden]), not a bare #chat-view rule -- an unconditional display:flex
+   here would always outrank [hidden]'s display:none (ID selector beats
+   attribute selector, full stop, no matter what order the rules are in).
+   Conditioning it on :not([hidden]) means there's no unconditional rule left
+   to conflict with when hidden is actually present. */
+
+#sidebar {
+  width: 220px;
+  flex-shrink: 0;
+  border-right: 1px solid #ddd;
+  padding: 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  overflow-y: auto;
+}
+#new-chat-button { width: 100%; }
+
+#session-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.25rem; }
+.session-item {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  padding: 0.4rem 0.5rem;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.session-item:hover { background: #f0f0f0; }
+.session-item.active { background: #dbe9ff; }
+.session-item .title {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.9rem;
+}
+.session-item .title-input { flex: 1; font: inherit; font-size: 0.9rem; padding: 0.1rem 0.25rem; }
+.session-item .icon-button {
+  border: none;
+  background: none;
+  padding: 0.1rem 0.3rem;
+  font-size: 0.85rem;
+  border-radius: 3px;
+}
+.session-item .icon-button:hover { background: #e0e0e0; }
+
+#chat-pane {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  padding: 1rem 1.5rem;
+  max-width: 720px;
 }
 
-input,
-textarea {
-    font: inherit;
-    padding: 0.5rem;
-    border: 1px solid #ccc;
-    border-radius: 4px;
-}
+header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem; }
+#session-label { font-size: 0.85rem; color: #666; }
 
-button {
-    font: inherit;
-    padding: 0.5rem 1rem;
-    border: 1px solid #333;
-    border-radius: 4px;
-    background: #fff;
-    cursor: pointer;
-}
+#transcript { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 0.75rem; margin-bottom: 1rem; }
+.turn { padding: 0.5rem 0.75rem; border-radius: 8px; max-width: 80%; white-space: pre-wrap; }
+.turn.user { align-self: flex-end; background: #dbe9ff; }
+.turn.assistant { align-self: flex-start; background: #eee; }
 
-button:hover {
-    background: #f0f0f0;
-}
-
-.error {
-    color: #b00020;
-    min-height: 1.2em;
-    font-size: 0.9rem;
-}
-
-header {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    margin-bottom: 1rem;
-}
-
-#session-label {
-    font-size: 0.85rem;
-    color: #666;
-}
-
-#transcript {
-    display: flex;
-    flex-direction: column;
-    gap: 0.75rem;
-    margin-bottom: 1rem;
-}
-
-.turn {
-    padding: 0.5rem 0.75rem;
-    border-radius: 8px;
-    max-width: 80%;
-    white-space: pre-wrap;
-}
-
-.turn.user {
-    align-self: flex-end;
-    background: #dbe9ff;
-}
-
-.turn.assistant {
-    align-self: flex-start;
-    background: #eee;
-}
-
-#chat-form {
-    flex-direction: row;
-    max-width: none;
-}
-
-#chat-input {
-    flex: 1;
-    resize: vertical;
-}
+#chat-form { flex-direction: row; max-width: none; }
+#chat-input { flex: 1; resize: vertical; }
