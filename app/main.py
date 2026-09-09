@@ -7,18 +7,22 @@ from pydantic import BaseModel
 
 from app import core
 from app.db import User, create_db_and_tables
+from app.observability import configure_logging, configure_tracing
 from app.schemas import UserCreate, UserRead
 from app.users import auth_backend, current_active_user, fastapi_users
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    configure_logging(level=10)
     await create_db_and_tables()
     await core.session_service.prepare_tables()
     yield
 
 
 app = FastAPI(lifespan=lifespan)
+
+# configure_tracing(app)
 
 app.include_router(fastapi_users.get_auth_router(auth_backend), prefix="/auth", tags=["auth"])
 app.include_router(fastapi_users.get_register_router(UserRead, UserCreate), prefix="/auth", tags=["auth"])

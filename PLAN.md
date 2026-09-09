@@ -10,6 +10,7 @@
 9. Reverted 'send_message()', no longer a thin wrapper of 'stream_message()'
 10. Replace InMemorySessionService with DatabaseSessionService
 11. Multi-session management -- list, open, rename, delete
+12. Add observability: Configure logging & races for hypercorn, google-adk
 
 
 # Backlog

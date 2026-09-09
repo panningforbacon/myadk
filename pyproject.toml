@@ -11,6 +11,7 @@ dependencies = [
     "fastapi-users[sqlalchemy]>=15.0.5",
     "google-adk>=2.8.0",
     "hypercorn>=0.18.0",
+    "opentelemetry-instrumentation-fastapi>=0.50b0",
     "python-dotenv>=1.2.3",
 ]
 
