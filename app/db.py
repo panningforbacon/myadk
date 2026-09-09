@@ -1,5 +1,10 @@
+import os
 import uuid
 from collections.abc import AsyncGenerator
+
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from fastapi import Depends
 from fastapi_users.db import SQLAlchemyUserDatabase
@@ -11,7 +16,7 @@ from fastapi_users_db_sqlalchemy.access_token import (
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
 
-DATABASE_URL = "sqlite+aiosqlite:///./users.db"
+DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite+aiosqlite:///./database.db")
 
 engine = create_async_engine(DATABASE_URL)
 async_session_maker = async_sessionmaker(engine, expire_on_commit=False)

@@ -6,14 +6,15 @@ load_dotenv()
 
 from google.adk.agents.run_config import RunConfig, StreamingMode
 from google.adk.runners import Runner
-from google.adk.sessions import InMemorySessionService
+from google.adk.sessions import DatabaseSessionService
 from google.genai import types
 
 from app.agent import root_agent
+from app.db import engine
 
 APP_NAME = "adk_fastapi_demo"
 
-session_service = InMemorySessionService()
+session_service = DatabaseSessionService(db_engine=engine)
 runner = Runner(app_name=APP_NAME, agent=root_agent, session_service=session_service)
 
 

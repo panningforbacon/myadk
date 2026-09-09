@@ -16,4 +16,4 @@
 - Email verification of registrations
 - Password reset functionality
 - Superuser: Optionally view all users and access their sessions (as read-only)
-- Observability
+- Observability -- FastAPI and Google-ADK
