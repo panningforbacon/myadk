@@ -286,20 +286,6 @@ $("chat-form").addEventListener("submit", async (e) => {
   input.value = "";
   input.disabled = true;
 
-  if (isFirstTurn) {
-    // Independent of the chat call below: not awaited here, not sequenced
-    // before or after it. Its own response updates the sidebar directly
-    // when it resolves; if it's slow or fails, the chat reply is unaffected.
-    fetch(`/sessions/${sessionId}/title`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message }),
-    })
-      .then((res) => (res.ok ? res.json() : null))
-      .then((data) => { if (data) updateSidebarTitle(sessionId, data.title); })
-      .catch((err) => console.error("title generation failed:", err));
-  }
-
   try {
     const res = await fetch("/chat/stream", {
       method: "POST",
@@ -325,6 +311,21 @@ $("chat-form").addEventListener("submit", async (e) => {
     input.disabled = false;
     input.focus();
   }
+
+  if (isFirstTurn) {
+    // Independent of the chat call below: not awaited here, not sequenced
+    // before or after it. Its own response updates the sidebar directly
+    // when it resolves; if it's slow or fails, the chat reply is unaffected.
+    fetch(`/sessions/${sessionId}/title`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message }),
+    })
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => { if (data) updateSidebarTitle(sessionId, data.title); })
+      .catch((err) => console.error("title generation failed:", err));
+  }
+
 });
 
 // --- entry point --------------------------------------------------------------

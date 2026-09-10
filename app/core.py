@@ -63,6 +63,17 @@ async def delete_session(user_id: str, session_id: str) -> None:  # raises Sessi
     await session_service.delete_session(app_name=APP_NAME, user_id=user_id, session_id=session_id)
 
 
+def _answer_text(content: types.Content | None) -> str | None:
+    if not content or not content.parts:
+        return None
+    for part in content.parts:
+        if part.thought:
+            continue
+        if part.text:
+            return part.text
+    return None
+
+
 async def get_transcript(user_id: str, session_id: str) -> list[Turn]:
     session = await session_service.get_session(app_name=APP_NAME, user_id=user_id, session_id=session_id)
     if session is None:
@@ -72,9 +83,7 @@ async def get_transcript(user_id: str, session_id: str) -> list[Turn]:
     for event in session.events:
         if not (event.author == "user" or event.is_final_response()):
             continue
-        if not (event.content and event.content.parts):
-            continue
-        text = event.content.parts[0].text
+        text = _answer_text(event.content)
         if not text:
             continue
         role = "user" if event.author == "user" else "assistant"
@@ -106,19 +115,14 @@ async def maybe_generate_title(user_id: str, session_id: str, first_message: str
 
 
 async def rename_session(user_id: str, session_id: str, title: str) -> None:
-    last_error: StaleSessionError | None = None
-    for _ in range(3):
-        session = await session_service.get_session(app_name=APP_NAME, user_id=user_id, session_id=session_id)
-        if session is None:
-            raise SessionNotFoundError(f"no session {session_id!r} for user {user_id!r}")
-        event = Event(author="system", actions=EventActions(state_delta={"title": title}))
-        try:
-            await session_service.append_event(session, event)
-            return
-        except StaleSessionError as err:
-            last_error = err
-    if last_error:
-        raise last_error
+    session = await session_service.get_session(app_name=APP_NAME, user_id=user_id, session_id=session_id)
+    if session is None:
+        raise SessionNotFoundError(f"no session {session_id!r} for user {user_id!r}")
+    event = Event(author="system", actions=EventActions(state_delta={"title": title}))
+    try:
+        await session_service.append_event(session, event)
+    except StaleSessionError:
+        logger.error(f"[StaleSessionError] mid-stream for session {session_id!r}; unable to set state (title='{title!r}')")
 
 
 async def generate_title(first_message: str) -> str:
@@ -145,22 +149,19 @@ async def stream_message(user_id: str, session_id: str, message: str):
 
     yielded_any = False
     final_event = None
-    try:
-        async for event in runner.run_async(user_id=user_id, session_id=session_id, new_message=user_message, run_config=run_config):
-            if event.partial and event.content and event.content.parts:
-                text = event.content.parts[0].text
-                if text:
-                    yielded_any = True
-                    yield text
-                elif event.is_final_response():
-                    final_event = event
-            if not yielded_any and final_event and final_event.content and final_event.content.parts:
-                text = final_event.content.parts[0].text
-                if text:
-                    yield text
-    except StaleSessionError:
-        logger.warning(f"StaleSessionError mid-stream for session {session_id!r}; ending stream early instead of propagating (likely raced a concurrent title write)")
-        return
+    async for event in runner.run_async(user_id=user_id, session_id=session_id, new_message=user_message, run_config=run_config):
+        if event.partial:
+            text = _answer_text(event.content)
+            if text:
+                yielded_any = True
+                yield text
+            elif event.is_final_response():
+                final_event = event
+
+        if not yielded_any and final_event and final_event.content and final_event.content.parts:
+            text = final_event.content.parts[0].text
+            if text:
+                yield text
 
 
 # async def send_message(user_id: str, session_id: str, message: str) -> str:

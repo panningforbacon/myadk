@@ -14,7 +14,7 @@ from app.users import auth_backend, current_active_user, fastapi_users
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    configure_logging(level=10)
+    configure_logging()
     await create_db_and_tables()
     await core.session_service.prepare_tables()
     yield
