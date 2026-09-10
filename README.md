@@ -265,3 +265,9 @@ adk-fastapi-demo/
   permanent gap, not a bug.
 - Email verification / password reset routes exist in `fastapi-users` but are
   not mounted — deferred, not yet requested.
+
+# Backlog
+- Rebuild front-end as a component'ized and reactive app (React or SolidJS)
+- Email verification of registrations
+- Password reset functionality
+- Superuser: Optionally view all users and access their sessions (as read-only)
