@@ -1,138 +1,267 @@
-# My first Google-ADK + FastAPI app
+# adk-fastapi-demo Project History
 
-A minimal scaffold for learning how Google ADK, FastAPI, and `fastapi-users`
-fit together: `Agent` + `SessionService` → `Runner`, run behind either an
-HTTP API + browser front end, or a local CLI REPL.
+A minimal Google ADK agent behind a FastAPI + Hypercorn backend, built iteratively
+as a learning project. Each section below is a requirement and the strategy used
+to meet it; bug fixes discovered later are folded into the iteration whose code
+they touch, not broken out separately.
 
-## Architecture
+## History
+
+### 1. Scaffold: ADK agent behind FastAPI + Hypercorn
+
+**Requirement:** a minimal working agent, servable over HTTP, in a repo structure
+that wouldn't need rearchitecting as features got added.
+
+**Strategy:** `uv`-managed project, `google-adk>=2.0.0,<3.0.0` (resolved to 2.8.0),
+`python-dotenv` for `GOOGLE_API_KEY` (`load_dotenv()` must run before any module
+that reads env vars at import time — a recurring fragility, eventually fixed by
+calling it redundantly at the top of both `core.py` and `db.py`).
+
+Split the code three ways from the start:
+- **`core.py`** — all ADK-facing logic, framework-agnostic. No FastAPI imports.
+- **`main.py`** — thin HTTP adapter over `core.py`.
+- **`cli.py`** — a separate REPL adapter (fixed `CLI_USER_ID`, one session per
+  launch), for exercising `core.py` without a server.
+
+This split paid off repeatedly: multi-user support, the SQLite→Postgres swap,
+and streaming were all added later with **zero changes to `core.py`'s function
+signatures**.
+
+### 2. Multi-user sessions
+
+**Requirement:** support more than one user without cross-contaminating history.
+
+**Strategy:** started with a deterministic `session_id` (`f"{user_id}-session"`),
+replaced entirely once "manage multiple sessions per user" became a real
+requirement — session CRUD (`POST`/`GET`/`DELETE /sessions`), with the
+**server** generating `session_id`s rather than accepting client-supplied ones,
+closing off collision/replay.
+
+### 3. Real authentication
+
+**Requirement:** stop trusting a client-supplied `user_id`; support login/logout
+with actual revocation.
+
+**Strategy:** `fastapi-users` 15.x backed by SQLite (later Postgres-swappable).
+Chose **`DatabaseStrategy`** over JWT specifically because logout needs to
+*revoke* access by deleting the `access_token` row — a stateless JWT can't do
+that. `User` / `AccessToken` tables live in the same database as ADK's own
+session storage but in separate, independently-managed schemas.
+
+### 4. Streaming responses
+
+**Requirement:** stream the agent's reply to the client as it's generated,
+not all at once.
+
+**Strategy:** `RunConfig(streaming_mode=StreamingMode.SSE)` — confirmed via
+source inspection to control `partial=True` delta-event emission; the name is
+ADK's internal label for that behavior, not a commitment to the SSE wire
+protocol. On the wire, chose `StreamingResponse` via `fetch()` +
+`ReadableStream` over `EventSource`, because `EventSource` is GET-only (can't
+carry a JSON body) and auto-reconnects, which is wrong mid-turn.
+
+**Bug found later, fixed here:** `stream_message` read `event.content.parts[0].text`
+unconditionally. Gemini 2.5 models think by default (`types.Part.thought: bool`,
+distinct from the answer) unless `thinking_config` disables it — nothing in
+`agent.py` does. The model's reasoning trace, which routinely recaps prior
+turns while reasoning about a new one, was streaming straight into the chat
+bubble and being written into the transcript, indistinguishable from a real
+answer — surfacing as what looked like the first turn's response bleeding
+into the second turn's.
+
+Ruled out first, with actual reproductions (not just reading code), before
+landing on the real cause:
+- Frontend double-submission — structurally clean, ruled out by inspection.
+- ADK replaying old session events into a later turn's stream — built a real
+  `Runner` + `DatabaseSessionService` + a minimal fake agent, ran two genuine
+  sequential turns, confirmed turn 2's yielded events contain nothing from
+  turn 1.
+- The `StaleSessionError` recovery path (see §7) corrupting the next turn —
+  same rig, simulated turn 1 crashing mid-stream; turn 2 still came back clean.
+  Also ruled out ADK's task-scope resume detection, since it's scoped to
+  function-call/task-agent delegation and `root_agent` has neither.
+
+Fix: a shared `_answer_text()` helper that returns the first *non-thought*
+part's text, used in the streaming loop, its no-partials fallback branch, and
+`get_transcript`. Verified against a fake agent that emits a thought part
+followed by the real answer, streamed the same way Gemini would: only the
+real answer reaches the client and the transcript.
+
+### 5. Session storage: in-memory → database, SQLite → Postgres
+
+**Requirement:** sessions need to survive a restart, and the storage backend
+needs to be swappable between local dev (SQLite) and production (Postgres)
+without app-level changes.
+
+**Strategy:** `DatabaseSessionService(db_engine=engine)`, sharing the same
+`AsyncEngine` already used for `fastapi-users` — one physical database, two
+independently-versioned schemas. `DATABASE_URL` env var selects the backend
+(`sqlite+aiosqlite:///...` for dev, `postgresql+asyncpg://...` for prod).
+
+Verified for real, not just asserted: installed Postgres in-sandbox via apt,
+ran the identical test suite against both backends, confirmed identical
+results. Confirmed persistence-across-restart on both backends using genuinely
+separate subprocess invocations — a single-process `TestClient` reuse pattern
+crashes `asyncpg` (its connections are event-loop-bound), which turned out to
+be a test-methodology artifact, not an app bug, resolved by re-testing via
+separate `uv run python -c` subprocess calls.
+
+Because of the `core.py`/`main.py` split from §1, this swap required **zero**
+changes to any function signature in `core.py`.
+
+### 6. Frontend
+
+**Requirement:** a usable chat UI without turning this into a frontend project.
+
+**Strategy:** vanilla JS, no framework, no build step — deliberately rejected a
+SolidJS/bundler approach as contrary to the project's actual goal (learn
+ADK/FastAPI, not frontend tooling), and same-origin static serving avoids
+CORS/SameSite cookie complications a separate dev server would introduce.
+Three view containers (`#auth-view`, `#chat-view`, sidebar + chat pane).
+Static files mounted **last** in `main.py` (`StaticFiles(..., html=True)`),
+confirmed via test that explicit API routes still take precedence — Starlette
+matches routes in registration order.
+
+**Bug found later, fixed here:** the sidebar's layout CSS added
+`#chat-view { display: flex; height: 100%; }`. An ID selector (specificity
+`1,0,0`) always outranks `[hidden] { display: none; }` (specificity `0,1,0`),
+so `#chat-view` never actually hid regardless of the `hidden` attribute.
+Fixed by conditioning the rule on `:not([hidden])` instead of reaching for
+`!important`, which would only have set up the next specificity fight instead
+of ending them. Checked every other ID-selector `display` rule in the
+stylesheet for the same class of bug — none of those elements are ever
+toggled via `.hidden`, so this was the only instance.
+
+**Known, unfixed:** the "Send" button isn't disabled during streaming (only
+the textarea is). It doesn't cause real resubmission — the textarea is
+cleared and disabled, so there's nothing to send — but it's a real UI gap
+worth closing.
+
+### 7. Multi-session management: CRUD, rename, LLM-generated titles
+
+**Requirement:** a session picker (list, switch, rename, delete), with titles
+generated automatically from the first message rather than left blank.
+
+**Strategy — title generation went through three designs:**
+1. Starlette `BackgroundTask` (runs after the full response is sent) —
+   abandoned because titling never even *started* until the reply had already
+   fully rendered, adding latency for no reason.
+2. `core.py`-internal `asyncio.create_task` with a strong-ref set to prevent
+   GC of unawaited tasks — functional, but kept the frontend blind to when a
+   title actually landed.
+3. **Final:** the frontend fires two independent, concurrent `fetch()` calls —
+   the chat request and `POST /sessions/{id}/title` — neither awaited against
+   the other. `core.py` exposes a directly-awaited, idempotent
+   `maybe_generate_title`, and new sessions get `state={"title": "Untitled"}`
+   at creation (not via a later event) specifically so the endpoint's
+   idempotency check — *is the title still "Untitled"?* — is race-free against
+   the chat call's own concurrent event-appending. Checking the title's
+   **value**, not turn/event count, was the detail that made this race-free.
+
+`title_agent` is a second, independent `Agent` + `Runner`, deliberately **not**
+a `sub_agent` of `root_agent` — ADK's `sub_agents` delegation is model-decided
+within one session, the wrong fit for an unconditional backend-triggered side
+task. A separate `Runner` sharing the same `session_service` under a distinct
+`TITLE_APP_NAME` gives free storage isolation; `generate_title` creates a
+scratch session and deletes it in a `finally` block (create-and-discard, so a
+persistent scratch session doesn't accumulate every past title request as
+history degrading future ones).
+
+**Bug found later, fixed here — `StaleSessionError`, in two parts:**
+
+*Part one — `rename_session` itself.* ADK's `append_event` does optimistic
+concurrency checking, coarse-grained at the whole-session level: it compares
+the loaded session object's storage revision against the current one, and
+raises `StaleSessionError` if a concurrent writer advanced it first. Firing
+the chat request and the title request concurrently (by design, from the
+final title-generation design above) means two independent writers can
+legitimately race on the same session row — confirmed live via a traceback
+from a real deployment, and reproduced deterministically in the sandbox with
+`asyncio.gather` of two concurrent writers to one session. Fixed with a
+3-attempt reload-and-retry loop in `rename_session`, catching
+`StaleSessionError` — which is exactly what the exception's own message asks
+for ("reload the session before appending more events"), not a workaround.
+
+*Part two — the symmetric risk on `/chat/stream`.* The race is symmetric:
+either writer can lose it. ADK's own `Runner` has no retry for its normal
+turn-appending path (only one narrow `except StaleSessionError` exists,
+scoped to an unrelated optional compaction feature) — so `/chat/stream`
+itself could just as easily crash mid-stream. There's no clean way to retry
+there (some text may already be streamed to the client, and re-running
+`run_async` would re-submit the user's message). Fixed by catching
+`StaleSessionError` around the streaming loop and ending the stream
+gracefully where it is, logged as a warning, instead of letting an unhandled
+exception break the ASGI connection. Verified by mocking `run_async` to yield
+partial text then raise mid-stream, confirming already-streamed text survives
+and the generator exits cleanly rather than propagating.
+
+### 8. Observability: logs and traces
+
+**Requirement:** understand what FastAPI and ADK each provide out of the box,
+and how they might conflict, before wiring anything up.
+
+**Findings, from reading the actual installed packages rather than assuming:**
+- **Logging:** ADK (`google_adk.*`) and Starlette/FastAPI are both
+  well-behaved — no handlers of their own, defer to root config. Hypercorn is
+  the exception: `hypercorn.error` (default `errorlog="-"`) attaches its own
+  handler directly with `propagate=True`, so once the app configures a root
+  handler, every Hypercorn-caught exception prints twice.
+- **Tracing:** ADK unconditionally wraps agent invocations, tool calls, and
+  model inference in spans via a **module-level** `tracer = trace.get_tracer(
+  "gcp.vertex.agent")`, resolved at import time — safe regardless of import
+  order because OTel's `get_tracer()` returns a `ProxyTracer` that resolves
+  the real provider lazily, on first span, not at construction. ADK only
+  calls `set_tracer_provider()` itself from its own `adk api_server` CLI dev
+  server, which this project doesn't use — so there's no fight over the
+  global (settable-once) `TracerProvider` singleton here. FastAPI has zero
+  built-in tracing of its own.
+
+**Strategy:** `app/observability.py`, called once from `main.py`'s lifespan
+startup for logging (must run *after* Hypercorn's own bootstrap constructs its
+loggers — proven by simulating that exact ordering and confirming the fix
+survives it) and at module level for tracing (matches standard
+`FastAPIInstrumentor` usage, no such ordering constraint). Dev default is
+`ConsoleSpanExporter`; set `OTEL_EXPORTER_OTLP_ENDPOINT` to switch to a real
+OTLP backend — deliberately the same env var ADK's own CLI already looks for.
+Verified end-to-end using ADK's **actual** tracer object (not a stand-in): a
+span it created shared the same `trace_id` as the surrounding FastAPI request
+span with the correct `parent_id` — nesting works with zero manual context
+propagation.
+
+**Bug found immediately after, fixed here:** the OTLP branch referenced
+`opentelemetry-exporter-otlp-proto-http` without it ever being declared as a
+project dependency — only surfaced once `OTEL_EXPORTER_OTLP_ENDPOINT` was
+actually set, since that's the only path that imports it, and the sandbox
+testing never exercised that branch. Added the missing dependency; confirmed
+against the exact scenario that broke (env var set, app boots clean).
+
+## File Layout
 
 ```
-app/
-  agent.py    # root_agent: the one LlmAgent, model + instruction only
-  core.py     # all ADK-facing logic: Runner, InMemorySessionService, and a
-              # plain async contract (create_session, list_sessions,
-              # delete_session, get_transcript, send_message) that raises
-              # SessionNotFoundError on a bad id. No HTTP, no auth, no CLI
-              # concerns leak in here.
-  db.py       # SQLAlchemy models + engine for fastapi-users (SQLite)
-  users.py    # fastapi-users wiring: UserManager, cookie+DB-session auth backend
-  schemas.py  # UserRead / UserCreate pydantic schemas for fastapi-users
-  main.py     # HTTP adapter over core.py + fastapi-users routers; serves the
-              # static front end
-  cli.py      # REPL adapter over core.py, single fixed local user, no auth
-  static/     # the browser front end: index.html + app.js + style.css,
-              # no framework, no build step, served by FastAPI itself
+adk-fastapi-demo/
+├── pyproject.toml
+└── app/
+    ├── agent.py            # root_agent, title_agent
+    ├── core.py             # all ADK logic (session CRUD, streaming, titles, transcript)
+    ├── db.py               # SQLAlchemy engine/tables for fastapi-users
+    ├── users.py            # fastapi-users wiring (DatabaseStrategy, cookie transport)
+    ├── schemas.py          # UserRead / UserCreate
+    ├── main.py             # FastAPI app, routes, lifespan (table setup + observability)
+    ├── observability.py    # logging + tracing setup
+    ├── cli.py              # standalone REPL adapter over core.py
+    └── static/
+        ├── index.html      # auth view + chat view (sidebar + chat pane)
+        ├── style.css
+        └── app.js          # vanilla JS, no framework
 ```
 
-`main.py` and `cli.py` both call into `core.py` and never touch ADK directly.
-`user_id` used to be a client-supplied argument; it's now `str(user.id)`,
-resolved from an authenticated cookie session (see **Auth** below) — a
-client can no longer just claim to be anyone.
+## Open Items
 
-## Setup
-
-```shell
-uv sync
-```
-
-Environment variables (put these in `.env`; `python-dotenv` loads it):
-
-| Variable | Purpose | Required |
-|---|---|---|
-| `GOOGLE_API_KEY` | Gemini API key (AI Studio), used by `root_agent` | Yes |
-| `AUTH_SECRET` | Signs password-reset/verification tokens (not the session token itself — see **Auth**) | No — has an insecure dev fallback; override before deploying anywhere but a laptop |
-
-## Usage: HTTP server + browser front end
-
-```shell
-uv run hypercorn app.main:app --bind 0.0.0.0:8000
-```
-
-Open `http://localhost:8000` — that's the static front end (`app/static/index.html`),
-served by FastAPI itself so cookie auth stays same-origin (no CORS to configure).
-Register an account, log in, and you're in a chat view: an empty session shows
-just the input box, a resumed non-empty session replays its prior turns first.
-
-### Routes
-
-| Method | Path | Notes |
-|---|---|---|
-| POST | `/auth/register` | Create an account (email + password) |
-| POST | `/auth/login` | Form-encoded (`username`, `password`, OAuth2 password flow shape) — sets a cookie |
-| POST | `/auth/logout` | Deletes the server-side session row; the cookie the client held becomes worthless immediately |
-| POST | `/sessions` | Create a new ADK session for the authenticated user |
-| GET | `/sessions` | List the authenticated user's sessions |
-| DELETE | `/sessions/{session_id}` | 404s if it's not this user's session (or doesn't exist) |
-| GET | `/sessions/{session_id}/messages` | Transcript: past turns, filtered the same way `/chat` filters a live response (user messages plus only `is_final_response()` agent events — tool calls and streaming partials excluded) |
-| POST | `/chat` | `{session_id, message}` → `{response}` |
-
-curl needs a cookie jar to exercise the authenticated routes:
-
-```shell
-curl -c cookies.txt -X POST http://localhost:8000/auth/register \
-  -H 'content-type: application/json' -d '{"email":"you@example.com","password":"hunter2pass"}'
-curl -c cookies.txt -b cookies.txt -X POST http://localhost:8000/auth/login \
-  -d 'username=you@example.com&password=hunter2pass'
-curl -b cookies.txt -X POST http://localhost:8000/sessions
-curl -b cookies.txt -X POST http://localhost:8000/chat \
-  -H 'content-type: application/json' \
-  -d '{"session_id":"[SESSION_ID]","message":"How did the days of the week get their names?"}'
-```
-
-## Auth
-
-`fastapi-users`, with a **server-side session**, not a JWT: login inserts a
-row into a SQLite `access_token` table and puts only that row's random token
-in an `httponly` cookie — nothing about identity is encoded in what the
-client holds. Logout deletes the row, which is what makes logout actually
-revoke access (a stateless JWT can't do this without a separate revocation
-list). `users.db` (SQLite) is created on first run; it holds the `user` and
-`access_token` tables and is safe to delete to reset all accounts.
-
-Not wired up: email verification and password reset. Both routers ship in
-`fastapi-users` (`get_verify_router`, `get_reset_password_router`) but aren't
-mounted in `main.py` yet.
-
-## Usage: CLI
-
-For local, single-user, single-session use — no HTTP, no auth involved:
-
-```shell
-uv run adk-chat
-```
-
-```
-session 3f9e2b7a-... -- type 'exit' to quit
-> How did the days of the week get their names?
-They're named after Sun, Moon, and five classical planets/gods.
-> exit
-```
-
-## Known limitations
-
-- **`InMemorySessionService` is process-local.** The CLI and the HTTP server
-  each build their own store at startup — a conversation started in one is
-  invisible to the other. A server restart (or running more than one worker
-  process) also drops every session that existed only in that process's
-  memory; the front end treats a since-vanished session as a signal to
-  silently start a fresh one rather than getting stuck (see `showChatFor` in
-  `app.js`).
-- **No session picker yet.** The front end resumes whichever of the
-  authenticated user's sessions was most recently updated; there's no UI yet
-  to list, rename, or switch between multiple sessions.
-- **`[hidden]` vs `form { display: flex }`:** worth knowing if you touch
-  `style.css` — a bare type selector for `form` is author-origin CSS, which
-  beats the browser's built-in `[hidden] { display: none }` (user-agent
-  origin) regardless of specificity. `style.css` now declares its own
-  `[hidden] { display: none; }` near the top to win back that rule on plain
-  specificity; don't remove it without checking `form`/`main`/etc. for
-  competing `display` declarations first.
-
-## Planned next
-
-- Streaming responses (ADK's `run_async` already yields per-token events;
-  needs a `StreamingResponse`/SSE route plus `EventSource` or
-  `fetch`+`ReadableStream` on the front end — no framework required either way)
-- Session management UI (list, rename, delete) — ADK sessions have no name
-  field today, so "rename" would live in `session.state`
-- Email verification and password-reset flows (backend routers exist, unmounted)
+- Session rename UI, multi-session picker, and LLM-generated titles are fully
+  implemented as of §7.
+- The "Send" button isn't disabled during streaming (§6) — cosmetic, not yet
+  fixed.
+- CLI (`app/cli.py`) has no titling or streaming support — accepted as a
+  permanent gap, not a bug.
+- Email verification / password reset routes exist in `fastapi-users` but are
+  not mounted — deferred, not yet requested.
