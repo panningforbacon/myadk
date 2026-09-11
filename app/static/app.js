@@ -274,17 +274,28 @@ $("chat-form").addEventListener("submit", async (e) => {
   const message = input.value.trim();
   if (!message) return;
 
-  // Cheap client-side proxy for "is this the session's first turn": an empty
-  // transcript before this send means it is -- the only case worth firing
-  // the title request for at all.
   const isFirstTurn = $("transcript").children.length === 0;
   const sessionId = currentSessionId; // captured now, not read again later --
-  // if the user switches sessions while this is in flight, currentSessionId
-  // may have moved on by the time these promises resolve.
 
   addTurn("user", message);
   input.value = "";
   input.disabled = true;
+
+  // if (isFirstTurn) {
+  //   try {
+  //     const titleRes = await fetch(`/sessions/${sessionId}/title`, {
+  //       method: "POST",
+  //       headers: { "Content-Type": "application/json" },
+  //       body: JSON.stringify({ message }),
+  //     });
+  //     if (titleRes.ok) {
+  //       const data = await titleRes.json();
+  //       updateSidebarTitle(sessionId, data.title);
+  //     }
+  //   } catch (err) {
+  //     console.error("title generation failed:", err);
+  //   }
+  // }
 
   try {
     const res = await fetch("/chat/stream", {
@@ -311,21 +322,6 @@ $("chat-form").addEventListener("submit", async (e) => {
     input.disabled = false;
     input.focus();
   }
-
-  if (isFirstTurn) {
-    // Independent of the chat call below: not awaited here, not sequenced
-    // before or after it. Its own response updates the sidebar directly
-    // when it resolves; if it's slow or fails, the chat reply is unaffected.
-    fetch(`/sessions/${sessionId}/title`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message }),
-    })
-      .then((res) => (res.ok ? res.json() : null))
-      .then((data) => { if (data) updateSidebarTitle(sessionId, data.title); })
-      .catch((err) => console.error("title generation failed:", err));
-  }
-
 });
 
 // --- entry point --------------------------------------------------------------

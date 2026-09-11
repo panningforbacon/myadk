@@ -1,12 +1,13 @@
 import logging
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from typing import Literal
 
 from dotenv import load_dotenv
 
 load_dotenv()
 
-from google.adk.agents._streaming_mode import StreamingMode
-from google.adk.agents.run_config import RunConfig
+from google.adk.agents.run_config import RunConfig, StreamingMode
 from google.adk.errors import StaleSessionError
 from google.adk.events import Event, EventActions
 from google.adk.runners import Runner
@@ -30,6 +31,27 @@ class SessionNotFoundError(Exception):
     """Raised for any operation against a user_id/session_id pair that doesn't exist."""
 
 
+class ConcurrentUpdateError(Exception):
+    """A session write lost ADK's optimistic-concurrency check and couldn't be retried."""
+
+
+PartKind = Literal["text", "thought"]
+
+
+@dataclass(frozen=True)
+class TurnPart:
+    """One text-bearing piece of a model turn, tagged with what kind it is."""
+
+    kind: PartKind
+    text: str
+
+
+# A streamed delta and a stored transcript part carry the same payload, so they
+# share one type. Aliased rather than used directly so tool calls and grounding
+# can widen this union later without touching stream_message's signature.
+type StreamEvent = TurnPart
+
+
 @dataclass
 class SessionInfo:
     session_id: str
@@ -40,10 +62,12 @@ class SessionInfo:
 @dataclass
 class Turn:
     role: str  # "user" | "assistant"
-    text: str
+    parts: list[TurnPart]
 
 
 DEFAULT_TITLE = "Untitled"
+
+RENAME_ATTEMPTS = 3
 
 
 async def create_session(user_id: str) -> str:
@@ -63,15 +87,16 @@ async def delete_session(user_id: str, session_id: str) -> None:  # raises Sessi
     await session_service.delete_session(app_name=APP_NAME, user_id=user_id, session_id=session_id)
 
 
-def _answer_text(content: types.Content | None) -> str | None:
+def _parts(content: types.Content | None) -> list[TurnPart]:
+    """Every text-bearing part, in order, tagged thought-or-answer."""
     if not content or not content.parts:
-        return None
-    for part in content.parts:
-        if part.thought:
-            continue
-        if part.text:
-            return part.text
-    return None
+        return []
+    return [TurnPart(kind="thought" if part.thought else "text", text=part.text) for part in content.parts if part.text]
+
+
+def _answer_text(content: types.Content | None) -> str:
+    """The answer alone, thoughts excluded, concatenated across parts."""
+    return "".join(part.text for part in _parts(content) if part.kind == "text")
 
 
 async def get_transcript(user_id: str, session_id: str) -> list[Turn]:
@@ -83,11 +108,11 @@ async def get_transcript(user_id: str, session_id: str) -> list[Turn]:
     for event in session.events:
         if not (event.author == "user" or event.is_final_response()):
             continue
-        text = _answer_text(event.content)
-        if not text:
+        parts = _parts(event.content)
+        if not parts:
             continue
         role = "user" if event.author == "user" else "assistant"
-        turns.append(Turn(role=role, text=text))
+        turns.append(Turn(role=role, parts=parts))
 
     return turns
 
@@ -115,14 +140,21 @@ async def maybe_generate_title(user_id: str, session_id: str, first_message: str
 
 
 async def rename_session(user_id: str, session_id: str, title: str) -> None:
-    session = await session_service.get_session(app_name=APP_NAME, user_id=user_id, session_id=session_id)
-    if session is None:
-        raise SessionNotFoundError(f"no session {session_id!r} for user {user_id!r}")
-    event = Event(author="system", actions=EventActions(state_delta={"title": title}))
-    try:
-        await session_service.append_event(session, event)
-    except StaleSessionError:
-        logger.error(f"[StaleSessionError] mid-stream for session {session_id!r}; unable to set state (title='{title!r}')")
+    """Write the title, reloading and retrying if a concurrent writer beat us."""
+
+    for attempt in range(1, RENAME_ATTEMPTS + 1):
+        session = await session_service.get_session(app_name=APP_NAME, user_id=user_id, session_id=session_id)
+        if session is None:
+            raise SessionNotFoundError(f"no session {session_id!r} for user {user_id!r}")
+
+        event = Event(author="system", actions=EventActions(state_delta={"title": title}))
+        try:
+            await session_service.append_event(session, event)
+            return
+        except StaleSessionError:
+            logger.warning(f"stale session on rename of {session_id!r}, attempt {attempt}/{RENAME_ATTEMPTS}")
+
+    raise ConcurrentUpdateError(f"gave up renaming {session_id!r} after {RENAME_ATTEMPTS} attempts")
 
 
 async def generate_title(first_message: str) -> str:
@@ -132,14 +164,16 @@ async def generate_title(first_message: str) -> str:
         user_message = types.Content(role="user", parts=[types.Part(text=first_message)])
         title = ""
         async for event in title_runner.run_async(user_id=title_user_id, session_id=session.id, new_message=user_message):
-            if event.is_final_response() and event.content and event.content.parts:
-                title = event.content.parts[0].text or ""
+            if event.is_final_response():
+                title = _answer_text(event.content)
         return title.strip()
     finally:
         await session_service.delete_session(app_name=TITLE_APP_NAME, user_id=title_user_id, session_id=session.id)
 
 
-async def stream_message(user_id: str, session_id: str, message: str):
+async def stream_message(user_id: str, session_id: str, message: str) -> AsyncIterator[StreamEvent]:
+    """Yield each delta once, whether or not the model streamed it."""
+
     session = await session_service.get_session(app_name=APP_NAME, user_id=user_id, session_id=session_id)
     if session is None:
         raise SessionNotFoundError(f"no session {session_id!r} for user {user_id!r}")
@@ -147,25 +181,24 @@ async def stream_message(user_id: str, session_id: str, message: str):
     user_message = types.Content(role="user", parts=[types.Part(text=message)])
     run_config = RunConfig(streaming_mode=StreamingMode.SSE)
 
-    yielded_any = False
-    final_event = None
-    async for event in runner.run_async(user_id=user_id, session_id=session_id, new_message=user_message, run_config=run_config):
-        if event.partial:
-            text = _answer_text(event.content)
-            if text:
-                yielded_any = True
-                yield text
-            elif event.is_final_response():
-                final_event = event
-
-        if not yielded_any and final_event and final_event.content and final_event.content.parts:
-            text = final_event.content.parts[0].text
-            if text:
-                yield text
-
-
-# async def send_message(user_id: str, session_id: str, message: str) -> str:
-#     return "".join([chunk async for chunk in stream_message(user_id, session_id, message)])
+    awaiting_aggregate = False
+    try:
+        async for event in runner.run_async(user_id=user_id, session_id=session_id, new_message=user_message, run_config=run_config):
+            if event.partial:
+                for part in _parts(event.content):
+                    awaiting_aggregate = True
+                    yield part
+            else:
+                if not awaiting_aggregate:
+                    # No partials preceded this one, so the aggregate is the only
+                    # delivery of this content rather than a repeat of it.
+                    for part in _parts(event.content):
+                        yield part
+                # Reset per LLM call, not per invocation: a tool call splits one
+                # turn into several, each with its own partials-then-aggregate.
+                awaiting_aggregate = False
+    except StaleSessionError as err:
+        raise ConcurrentUpdateError(f"lost a write race mid-stream on session {session_id!r}") from err
 
 
 async def send_message(user_id: str, session_id: str, message: str) -> str:  # raises SessionNotFoundError
@@ -176,8 +209,11 @@ async def send_message(user_id: str, session_id: str, message: str) -> str:  # r
     user_message = types.Content(role="user", parts=[types.Part(text=message)])
 
     final_text = ""
-    async for event in runner.run_async(user_id=user_id, session_id=session_id, new_message=user_message):
-        if event.is_final_response() and event.content and event.content.parts:
-            final_text = event.content.parts[0].text or ""
+    try:
+        async for event in runner.run_async(user_id=user_id, session_id=session_id, new_message=user_message):
+            if event.is_final_response():
+                final_text = _answer_text(event.content)
+    except StaleSessionError as err:
+        raise ConcurrentUpdateError(f"lost a write race on session {session_id!r}") from err
 
     return final_text

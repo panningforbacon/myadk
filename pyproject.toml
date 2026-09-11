@@ -44,5 +44,6 @@ unfixable = ["F401"]
 
 [tool.pyright]
 typeCheckingMode = "basic"  # "off", "basic", "standard", "strict"include = ["src"]
+include = ["app"]
 pythonVersion = "3.14"
 pythonPlatform = "All"

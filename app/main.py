@@ -1,3 +1,5 @@
+import logging
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, HTTPException
@@ -10,6 +12,8 @@ from app.db import User, create_db_and_tables
 from app.observability import configure_logging, configure_tracing
 from app.schemas import UserCreate, UserRead
 from app.users import auth_backend, current_active_user, fastapi_users
+
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
@@ -76,6 +80,20 @@ class TranscriptResponse(BaseModel):
     turns: list[TurnOut]
 
 
+def _answwer_text(parts: list[core.TurnPart]) -> str:
+    return "".join(p.text for p in parts if p.kind == "text")
+
+
+async def _plain_text(events: AsyncIterator[core.StreamEvent]) -> AsyncIterator[str]:
+    """Flatten typed deltas back down to bare text for the current wire format."""
+    try:
+        async for event in events:
+            if event.kind == "text":
+                yield event.text
+    except core.ConcurrentUpdateError:
+        logger.warning("ending stream early: lost a write race mid-turn")
+
+
 @app.get("/health", response_model=HealthResponse)
 async def get_health():
     return HealthResponse(status="pass")
@@ -107,6 +125,8 @@ async def rename_session(session_id: str, req: RenameSessionRequest, user: User 
         await core.rename_session(str(user.id), session_id, req.title)
     except core.SessionNotFoundError as err:
         raise HTTPException(status_code=404, detail="session not found") from err
+    except core.ConcurrentUpdateError as err:
+        raise HTTPException(status_code=409, detail="session was being written concurrently") from err
 
 
 @app.get("/sessions/{session_id}/messages", response_model=TranscriptResponse)
@@ -132,7 +152,7 @@ async def chat_stream(req: ChatRequest, user: User = Depends(current_active_user
     if not await core.session_exists(str(user.id), req.session_id):
         raise HTTPException(status_code=404, detail="session not found")
     return StreamingResponse(
-        core.stream_message(str(user.id), req.session_id, req.message),
+        _plain_text(core.stream_message(str(user.id), req.session_id, req.message)),
         media_type="text/plain",
     )
 
@@ -143,6 +163,8 @@ async def generate_session_title(session_id: str, req: TitleRequest, user: User 
         title = await core.maybe_generate_title(str(user.id), session_id, req.message)
     except core.SessionNotFoundError as err:
         raise HTTPException(status_code=404, detail="session not found") from err
+    except core.ConcurrentUpdateError as err:
+        raise HTTPException(status_code=409, detail="session was being written concurrently") from err
     return TitleResponse(title=title)
 
 
