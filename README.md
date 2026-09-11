@@ -235,6 +235,112 @@ actually set, since that's the only path that imports it, and the sandbox
 testing never exercised that branch. Added the missing dependency; confirmed
 against the exact scenario that broke (env var set, app boots clean).
 
+### 9. Typed stream events, thought parts, and write-race errors
+
+*(Commit A of the frontend-rebuild iteration: backend correctness only. The
+vanilla UI still runs unchanged against it; the NDJSON wire, the `/api` prefix,
+and the Solid port land in the commits after this one.)*
+
+**Requirement:** the upcoming UI needs to render the agent's thinking, tool
+activity, and grounding as distinct things — which the current stream can't
+express, since `/chat/stream` emits undelimited `text/plain`. Before changing
+the wire format, `core.py` had to start producing *typed* events instead of
+bare text, and the correctness gaps §4 and §7 left behind had to close.
+
+**Strategy — one part type, used everywhere:**
+`TurnPart(kind: "text" | "thought", text)`, produced by a single `_parts()`
+helper, replaces every `content.parts[0].text` read in the file. A streamed
+delta and a stored transcript part carry the same payload, so they share the
+type; `type StreamEvent = TurnPart` aliases it so tool calls and grounding can
+widen that union later without touching `stream_message`'s signature.
+
+`stream_message` now returns `AsyncIterator[StreamEvent]` — **the first change
+to a `core.py` signature in the project's history**, and a deliberate one. The
+§1 split's promise was that adapters absorb change, not that signatures never
+move; a type that can only say "text" was the actual ceiling on every feature
+this iteration exists to enable. `main.py` absorbs it for now by flattening
+back to text, which keeps the HTTP wire byte-identical for the vanilla UI.
+
+**Strategy — the streaming loop, rewritten around one invariant.** Confirmed
+from ADK's installed `streaming_utils.py` and `StreamingMode.SSE`'s own
+docstring: progressive SSE emits partial deltas and then, from the aggregator's
+`close()`, a single non-partial event repeating all of them — *per LLM call*,
+not per invocation. So the loop tracks `awaiting_aggregate`, yields partials as
+they arrive, yields a non-partial event only when no partials preceded it, and
+resets the flag on every non-partial. The old `yielded_any` flag was
+invocation-scoped and would have dropped the second half of any turn a tool
+call split in two.
+
+**Strategy — write races become a core-domain error.** `ConcurrentUpdateError`
+joins `SessionNotFoundError`; `core.py` translates ADK's `StaleSessionError`
+into it at the boundary, so HTTP adapters handle a lost race without importing
+`google.adk`. `main.py` maps it to **409** on rename and title, and ends the
+stream where it is (§7's graceful end, preserved until NDJSON can carry a
+typed error line instead).
+
+**Strategy — thought summaries turned on.** Gemini thinks regardless;
+`include_thoughts` only controls whether it returns the summary.
+`root_agent` now sets it via `generate_content_config.thinking_config` —
+verified against the installed ADK, which accepts it either there or on a
+`BuiltInPlanner` and warns if both are set, making the planner unnecessary.
+`title_agent` is deliberately left alone: nothing reads its reasoning.
+
+**Bugs found while verifying, fixed here:**
+
+- **The no-partials fallback was dead code, and wrong three ways over.** It sat
+  *inside* the `async for` and inside the `if event.partial:` branch, guarded by
+  `event.is_final_response()` — which is `False` for partial events by
+  construction, so `final_event` was never assigned and the branch never ran.
+  Had it run, it would have re-emitted on every subsequent iteration, and it
+  read `parts[0].text` directly — reintroducing the exact thought-leak §4
+  documents fixing. Replaced by the `awaiting_aggregate` invariant above.
+
+- **§7's `rename_session` retry loop did not exist.** The code made one
+  `append_event` attempt and logged the failure at ERROR with a copy-pasted
+  "mid-stream" message, then returned normally — so `PATCH` answered 204 and
+  `POST /title` returned a title that was never persisted. Now genuinely 3
+  attempts, each *reloading the session first* (retrying with the same stale
+  object fails identically every time), raising `ConcurrentUpdateError` when
+  all three lose.
+
+- **Two more `parts[0].text` reads survived §4's sweep**, in `generate_title`
+  and `send_message`. Both now go through `_answer_text()`, which also changed
+  behavior: it concatenates *all* non-thought parts rather than returning the
+  first. A reply split across several text parts previously lost everything
+  after the first one.
+
+- **`StreamingMode` was imported from a private path**
+  (`google.adk.agents._streaming_mode`). It is re-exported from
+  `google.adk.agents.run_config` — but *not* from `google.adk.agents`, which is
+  the plausible-looking guess.
+
+- **Pyright was checking nothing, and not for the documented reason.** The
+  config read `typeCheckingMode = "basic"  # ...comment...include = ["src"]` —
+  the `include` key was swallowed into the trailing comment on the same line,
+  so it never parsed at all. Fixed by putting it on its own line, pointed at
+  `app` rather than the nonexistent `src`.
+
+**README corrections (the docs had drifted from the code):** §4's claim that
+`_answer_text()` was used in "its no-partials fallback branch" described a
+branch that could never execute; §7's 3-attempt retry loop was described but
+never written; §7's claim that new sessions are created with
+`state={"title": "Untitled"}` is false — `create_session` sets no state, and
+`maybe_generate_title`'s idempotency check tests whether a title exists at all,
+not whether it still equals `"Untitled"`. The check is still race-free, for a
+slightly different reason than the one recorded. Fixed in place above.
+
+**Verified** with a scripted fake agent driven through the real `Runner` +
+`DatabaseSessionService`, in the style of §4 and §7: partials-then-aggregate
+yields each delta exactly once; a lone aggregate is still delivered; two LLM
+calls in one turn each de-duplicate independently; thoughts survive into the
+transcript as separate parts; a `StaleSessionError` on the model-turn append
+surfaces as `ConcurrentUpdateError` *after* the already-streamed text
+(discovered en route: failing the *first* append tests nothing, because the
+Runner persists the user message before the agent ever runs); rename succeeds
+on the third attempt and gives up on the fourth without writing. Plus HTTP-level
+tests asserting the wire is unchanged — thoughts excluded from both the
+transcript and the stream, and 409 on a rename race.
+
 ## File Layout
 
 ```
