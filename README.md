@@ -341,6 +341,141 @@ on the third attempt and gives up on the fourth without writing. Plus HTTP-level
 tests asserting the wire is unchanged — thoughts excluded from both the
 transcript and the stream, and 409 on a rename race.
 
+
+### 10. NDJSON wire, /api namespace, and CSRF defense
+
+*(Commit B of the frontend-rebuild iteration. The vanilla UI stops working
+here, deliberately — it calls unprefixed paths and reads bare text. Commit C
+brings up the build pipeline; commit D ports the UI and deletes `app/static/`.)*
+
+**Requirement:** three things the frontend rebuild needs from the backend
+before any framework code exists — a wire format that can distinguish thinking
+from answers and failure from completion, a path namespace a dev-server proxy
+can forward wholesale, and a CSRF story that doesn't depend on the frontend and
+backend sharing an origin by accident.
+
+**Design — the cross-origin problem, refused rather than solved.** A build step
+does not require two origins. Vite proxies `/api` to Hypercorn server-side, so
+the browser only ever talks to one port in dev; in production FastAPI serves the
+build. One origin in both environments means no CORS middleware, no
+`credentials: 'include'`, and no SameSite change — the entire category of
+complication this iteration was supposed to incur, declined.
+
+Worth recording because the original framing of this iteration got it backwards:
+SameSite compares *sites* — scheme plus registrable domain — and ports are not
+part of a site. `localhost:5173` → `localhost:8000` is same-site, and Lax
+cookies flow across it regardless. Two ports would have broken CORS (origins
+*do* include ports), not cookies. The one genuine trap there is mixing
+`localhost` and `127.0.0.1`, which *is* cross-site and drops the cookie silently.
+
+**Design — the wire.** `application/x-ndjson`, one JSON object per line:
+
+```
+{"type":"thought","delta":"User wants a one-line"}
+{"type":"text","delta":"Paris is the capital."}
+{"type":"done"}
+```
+
+Three rules carry the weight. Every server-controlled ending emits exactly one
+`done` or `error`, so a stream ending with **neither** means truncation — the
+one thing `text/plain` could never distinguish from success. Error codes are a
+closed set (`stale_session`, `internal`) and exception text never reaches the
+wire. Unknown `type` values are the client's problem to ignore, which makes
+`tool_call` and `grounding` purely additive later; they are *not* emitted now,
+because there is no tool to test them against and untested emitters are how §8's
+OTLP bug happened.
+
+Failures split by timing rather than kind: anything detectable before headers go
+out (401, 403, a missing session) stays an HTTP status code, and the pre-stream
+`session_exists` check survives precisely because it is the last moment that's
+still possible. After the first chunk, 200 is committed and errors can only be
+in-band.
+
+Serialization uses `match` over the event union (structural pattern matching,
+the idiom) with a `case _` that logs loudly — `StreamEvent` is explicitly built
+to widen, and a new member silently vanishing from the stream would be
+near-undebuggable from the client. `json.dumps` escapes embedded newlines, so
+splitting on `\n` downstream is unambiguous; verified with a delta containing a
+literal newline.
+
+**Design — `/api` namespace.** One `APIRouter(prefix="/api")` carries every
+route including the two fastapi-users routers, included at the bottom of the
+module (`include_router` copies routes *at call time*, so anything registered
+afterward silently wouldn't exist). One proxy rule, and no UI route can ever
+collide with an API path — `/sessions/{id}` would have, today.
+
+The catch-all static mount undercuts that on its own: an unmatched `/api/...`
+path falls through and answers an API call with HTML. Fixed with a bare ASGI
+404 mounted at `/api` between the router and the static mount. Deliberately a
+Mount and not a catch-all *route*, so it stays out of the OpenAPI schema commit
+C generates TypeScript types from. Accepted cost: under `/api`, a wrong method
+on a real path now returns 404 rather than 405.
+
+**Design — CSRF, because Lax alone isn't enough even same-origin.** Three gaps
+survive SameSite=Lax: same-site attackers (every other dev server on localhost
+is same-site with this one), routes whose bodies make them CORS-simple — no
+preflight, cookie attached, side effect lands — and login CSRF, which needs no
+cookie at all and so is unaffected by cookie policy entirely.
+
+`app/security.py` compares `Origin` against `Host` on unsafe methods and 403s on
+mismatch. No tokens, no state, ~30 lines, and it closes all three. Chosen over a
+double-submit token (needs a token endpoint, a cookie, and frontend plumbing)
+and over per-route checks (the point is that it can't be forgotten on a new
+route). Absent `Origin` is allowed: only browsers send it, and only browsers can
+be tricked into attaching someone else's cookie.
+
+Written as **pure ASGI rather than `BaseHTTPMiddleware`**, which buffers through
+an anyio stream and would sit between the client and a streaming response.
+Confirmed on a real socket: NDJSON lines arrive 400ms apart under Hypercorn with
+the middleware installed, not batched at the end.
+
+`cookie_secure` now reads `COOKIE_SECURE` from the environment and **defaults to
+true** — the dev-only value has to be opted into, so it can't reach production by
+being forgotten. `cookie_samesite="lax"` is stated explicitly; it was already
+the default, so this is documentation rather than a behavior change.
+
+**Findings from verification:**
+
+- **`urlsplit` on bytes returns bytes.** The first draft called `.encode()` on
+  an already-bytes netloc, which meant the middleware raised `AttributeError` on
+  *every* cross-origin request instead of returning 403 — caught only because a
+  test asserted the status code rather than merely that the request failed.
+- **Duplicate `Origin` or `Host` headers now reject outright.** A dict
+  comprehension over `scope["headers"]` silently keeps the last value, which
+  makes the check's verdict depend on which of two conflicting values a proxy
+  happened to append. Ambiguity is not a thing to resolve by coin-flip here.
+- **HTTP/2 has no `Host` header**, only `:authority`. Confirmed from Hypercorn's
+  `filter_pseudo_headers` that it synthesizes `host` from `:authority` for h2
+  and h3, so a header comparison is protocol-version-agnostic. Worth checking
+  rather than assuming: a security control that 403s everything under HTTP/2
+  would fail closed, loudly, in production only.
+- **`changeOrigin: true` on the Vite proxy would break this**, and the failure
+  mode is now pinned down: it rewrites `Host` to the backend's, so every unsafe
+  request arrives with `Origin: localhost:5173` and `Host: 127.0.0.1:8000` and
+  gets a 403. Reproduced both header shapes directly — the correct one passes,
+  the rewritten one 403s. Most copy-pasted proxy configs set it to `true`.
+- **`CookieTransport` already defaults to `secure=True` and `samesite="lax"`.**
+  So the previous `cookie_secure=False` wasn't a missing setting, it was an
+  explicit downgrade of a safe default — which is exactly the kind of thing a
+  "flip this before prod" comment fails to catch.
+
+**Also changed:** `TranscriptResponse` now returns `parts` rather than a
+flattened `text`, matching what the stream emits. Not in the original commit-B
+plan, but a reloaded session has to render identically to a live one, and doing
+it here keeps the wire changes in the commit named for them rather than
+reopening the schema in commit D.
+
+**Verified** with 25 assertions against the real ASGI app plus a live Hypercorn
+run: routes moved and old paths gone; unmatched `/api` paths answer JSON, not
+HTML; deltas serialize with a terminal `done`; a lost write race ends with
+`error/stale_session` and no `done`; a generic exception yields `internal` with
+no exception text leaked; embedded newlines don't split a line; cross-origin
+POST/DELETE 403 while GET passes and `Origin: null` is rejected; a same-site
+*different-port* origin is rejected (the case Lax would have allowed);
+`COOKIE_SECURE` unset produces `Secure`, `false` omits it; and NDJSON streams
+incrementally over a real socket with `Transfer-Encoding: chunked`.
+
+
 ## File Layout
 
 ```

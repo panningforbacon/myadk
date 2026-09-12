@@ -13,6 +13,8 @@ SECRET = os.environ.get("AUTH_SECRET", "dev-only-insecure-secret-change-me")
 
 SESSION_LIFETIME_SECONDS = 3600
 
+COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "true").lower() != "false"
+
 
 class UserManager(UUIDIDMixin, BaseUserManager[User, uuid.UUID]):
     reset_password_token_secret = SECRET
@@ -31,7 +33,8 @@ def get_database_strategy(
 
 cookie_transport = CookieTransport(
     cookie_max_age=SESSION_LIFETIME_SECONDS,
-    cookie_secure=False,
+    cookie_secure=COOKIE_SECURE,
+    cookie_samesite="lax",
 )
 
 auth_backend = AuthenticationBackend(
