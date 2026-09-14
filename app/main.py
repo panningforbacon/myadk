@@ -2,12 +2,14 @@ import json
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Literal
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from starlette.responses import Response
 from starlette.types import Receive, Scope, Send
 
 from app import core
@@ -20,9 +22,16 @@ from app.users import auth_backend, current_active_user, fastapi_users
 logger = logging.getLogger(__name__)
 
 
+FRONTEND_DIST = Path(__file__).resolve().parents[1] / "frontend" / "dist"
+FRONTEND_ASSETS = FRONTEND_DIST / "assets"
+FRONTEND_BUILT = (FRTONTEND_DIST / "index.html").is_file()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     configure_logging()
+    if not FRONTEND_BUILT:
+        logger.warning(f"no frontend build at {FRONTEND_DIST}; serving API only (run `npm run build` in frontend/)")
     await create_db_and_tables()
     await core.session_service.prepare_tables()
     yield
@@ -33,6 +42,8 @@ app.add_middleware(SameOriginOnly)
 
 # configure_tracing(app)
 
+# Everything the browser calls lives under /api, so the dev server needs exactly
+# one proxy rule and no UI route can ever collide with an API path.
 api = APIRouter(prefix="/api")
 
 api.include_router(fastapi_users.get_auth_router(auth_backend), prefix="/auth", tags=["auth"])
@@ -169,7 +180,7 @@ async def get_transcript(session_id: str, user: User = Depends(current_active_us
         turns = await core.get_transcript(str(user.id), session_id)
     except core.SessionNotFoundError as err:
         raise HTTPException(status_code=404, detail="session not found") from err
-    return TranscriptResponse(turns=[TurnOut(role=t.role, text=t.text) for t in turns])
+    return TranscriptResponse(turns=[TurnOut(role=t.role, parts=[PartOut(kind=p.kind, text=p.text) for p in t.parts]) for t in turns])
 
 
 @api.post("/chat", response_model=ChatResponse)
@@ -218,7 +229,29 @@ async def _api_not_found(scope: Scope, receive: Receive, send: Send) -> None:
 # stays out of the OpenAPI schema the frontend will generate its types from.
 app.mount("/api", _api_not_found, name="api-404")
 
+IMMUTABLE = "public, max-age=31536000, immutable"
+NO_CACHE = "no-cache"
+
+
+class HashedAssetFiles(StaticFiles):
+    """Cache fingerprinted bundles forever, never cache the file that names them.
+
+    Vite hashes everything under assets/, so those files are immutable by
+    construction. index.html is not hashed and points at them by name -- cached
+    even briefly, a browser will keep requesting chunks the last deploy deleted.
+    """
+
+    def file_response(self, full_path, stat_result, scope, status_code=200) -> Response:
+        response = super().file_response(full_path, stat_result, scope, status_code)
+        response.headers["cache-control"] = IMMUTABLE if FRONTEND_ASSETS in Path(full_path).parents else NO_CACHE
+        return response
+
+
 # Mounted last: Starlette matches routes in registration order, so every
 # explicit API route above wins over this catch-all. html=True serves
-# index.html for "/" and any unmatched path under it.
-app.mount("/", StaticFiles(directory="app/static", html=True), name="static")
+# index.html for directory paths -- it is not an SPA fallback, and Starlette
+# answers unmatched non-directory paths with 404. Nothing needs one yet: the
+# app has no client-side routing.
+
+if FRONTEND_BUILT:
+    app.mount("/", HashedAssetFiles(directory=FRONTEND_DIST, html=True), name="static")

@@ -476,6 +476,114 @@ POST/DELETE 403 while GET passes and `Origin: null` is rejected; a same-site
 incrementally over a real socket with `Transfer-Encoding: chunked`.
 
 
+### 11. Build pipeline: Vite + Solid, one origin in both environments
+
+*(Commit C of the frontend-rebuild iteration. The pipeline runs end to end here
+against a placeholder page; commit D ports the UI and deletes `app/static/`.)*
+
+**Requirement:** a component framework with a build step, without acquiring the
+cross-origin problems a build step is assumed to bring, and without a second
+server competing with FastAPI.
+
+**Framework — Solid 1.9, for the boring reasons.** Fine-grained reactivity is
+*not* the reason. At this scale a token stream is tens of updates per second
+into a few hundred nodes; React re-rendering one bubble per chunk would be fine.
+Choosing Solid for performance here would be choosing on vibes. The real
+reasons: existing proficiency, so this iteration's learning budget goes to the
+pipeline rather than a framework; and store path setters
+(`setMessages(i, "parts", j, "text", t => t + delta)`) mapping directly onto
+accumulating streamed deltas into nested state, which is the exact shape the
+thinking, tool, and grounding panels need.
+
+React's genuine advantage — streaming-markdown renderers and chat UI kits are
+React-first — is a real cost, accepted knowingly, payable the day markdown
+rendering lands.
+
+**Version choices, all deliberately conservative:**
+- **Solid 1.9.15, not 2.0.** 2.0 is at rc.8, and removes `createResource`,
+  `batch`, `on`, `createComputed`, and `produce` — every one of which existing
+  1.x proficiency leans on. Migration is backlogged until the router and
+  primitives go GA. The scaffolded `^1.9.15` already excludes 2.0, so no tighter
+  pin was warranted; the earlier worry that the template might hand over an RC
+  was unfounded, since `latest` is still 1.x.
+- **No SolidStart.** It's a meta-framework with its own server — a second
+  backend competing with FastAPI for the same job. A plain Vite SPA instead.
+- **Even so, `createResource` is avoided in application code** (the placeholder
+  uses `createSignal` + `onMount`), because the 2.0 migration gets smaller for
+  free if the removed primitives were never adopted.
+
+**Design — one origin in dev *and* prod, so the CORS work never happens.** Vite
+proxies `/api` to Hypercorn server-side; the browser only ever talks to
+`:5173`. In production FastAPI serves `frontend/dist`. Same-origin both ways
+means no CORS middleware, no `credentials: "include"`, and no SameSite change —
+the entire category of complication this iteration was expected to incur,
+declined rather than solved.
+
+Two comments in `vite.config.ts` are load-bearing. The target is `127.0.0.1`,
+not `localhost`, because Node may resolve `localhost` to `::1` while Hypercorn
+binds IPv4, and the failure is a silent `ECONNREFUSED`. And `changeOrigin` must
+stay **false**: it rewrites `Host` to the target's, which makes every unsafe
+request arrive as `Origin: localhost:5173` against `Host: 127.0.0.1:8000` and
+collect a 403 from §10's `SameOriginOnly`. Most copy-pasted proxy configs set it
+to `true`.
+
+**Design — static serving.** `FRONTEND_DIST` resolves from `__file__` rather
+than the working directory, so `hypercorn app.main:app` behaves identically from
+anywhere — the old `directory="app/static"` silently depended on being launched
+from the repo root. The mount is conditional on `index.html` existing, with the
+"API only" warning logged from inside `lifespan` rather than at module level,
+since `configure_logging()` hasn't run at import time.
+
+`HashedAssetFiles` overrides `file_response` to send
+`max-age=31536000, immutable` for anything under `assets/` and `no-cache` for
+everything else. Vite fingerprints asset filenames, so they're immutable by
+construction; `index.html` names them and is *not* hashed, so caching it even
+briefly leaves browsers requesting chunks the last deploy deleted.
+
+**Design — generated types.** `npm run gen:api` dumps FastAPI's schema by
+*importing* the app rather than hitting a running server (a codegen step that
+needs a live backend is a codegen step that breaks on CI), then runs
+`openapi-typescript` into a committed `src/api/schema.d.ts`. A renamed Pydantic
+field now fails `tsc` instead of silently rendering `undefined`.
+
+**Findings from building it:**
+
+- **The Vite template ships with `strict` unset**, so TypeScript defaults to
+  non-strict and the generated API types would have been close to ornamental.
+  Enabled in both `tsconfig.app.json` and `tsconfig.node.json`. The payoff shows
+  up immediately: `PartOut.kind` generates as `"text" | "thought"`, a real
+  discriminant rather than `string`.
+- **`openapi-typescript` and the template's TypeScript version don't coexist.**
+  The template pins `typescript ~6.0.2`; `openapi-typescript@7.13.0` peers on
+  `^5.x`, and there is no TS-6-compatible release on any dist-tag. Resolved by
+  pinning `typescript ~5.9.0` rather than reaching for `--legacy-peer-deps`,
+  which would have "resolved" it by lying. Nothing here uses a TS 6 feature —
+  `erasableSyntaxOnly` and `allowArbitraryExtensions` are both 5.x. Backlogged:
+  unpin when upstream supports TS 6.
+- **OpenAPI cannot describe the NDJSON stream.** `POST /api/chat/stream`
+  generates as `application/json: unknown`, because `StreamingResponse` bodies
+  aren't in the schema. This was predicted, and is now confirmed rather than
+  assumed: the `StreamLine` union stays hand-maintained, and it is the one place
+  where frontend and backend can drift silently.
+- **`html=True` is not an SPA fallback**, contradicting the comment that sat in
+  `main.py` since §2. Starlette serves `index.html` for *directory* paths only;
+  an unmatched non-directory path returns 404 — verified directly against a
+  running server (`/some/spa/route` → 404). Harmless today because there's no
+  client-side routing; the comment is now accurate, and the first router added
+  will need a real fallback.
+
+**Verified** against live servers in both modes rather than by inspection. Prod:
+Hypercorn alone serves the build, `index.html` returns `no-cache`, a hashed
+asset returns `immutable`, `/api/health` answers JSON, `/api/bogus` answers JSON
+404 rather than HTML. Dev: Vite on 5173 and Hypercorn on 8000, with `/api/health`
+proxied correctly, NDJSON lines arriving 400 ms apart through the proxy (so
+nothing buffers the stream), a same-origin POST returning 200, and a forged
+`Origin` still collecting a 403 — proving the CSRF check survives proxying with
+`changeOrigin: false`.
+
+
+
+
 ## File Layout
 
 ```

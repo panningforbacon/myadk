@@ -1,0 +1,13 @@
+:root {
+  color-scheme: light dark;
+  font-family: system-ui, sans-serif;
+}
+
+main {
+  margin: 4rem auto;
+  max-width: 40rem;
+  padding: 0 1rem;
+}
+
+.ok { color: seagreen; }
+.bad { color: crimson; }
