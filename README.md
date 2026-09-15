@@ -583,6 +583,123 @@ nothing buffers the stream), a same-origin POST returning 200, and a forged
 
 
 
+### 12. Solid UI: parity port, visible thinking, and streams that outlive the view
+
+*(Commit D, closing the frontend-rebuild iteration. `app/static/` is deleted
+here.)*
+
+**Requirement:** reach feature parity with the vanilla UI on the new pipeline,
+render the agent's thinking as a first-class thing rather than as text mixed
+into the answer, and give the app the state model the deferred features (tool
+calls, grounding, debug panels) will attach to.
+
+**Design — three layers, one direction.** `api/` knows about HTTP and nothing
+else, `state/` knows about policy and nothing about the DOM, components read
+state and call actions. The payoff is concrete rather than architectural
+theatre: `streamChat()` is the only function in the app that touches a response
+body, so the next wire-format change reaches exactly one file per side.
+
+**Design — one fetch wrapper, one 401 handler.** `apiFetch` adds the `/api`
+prefix and turns *any* 401 into `auth = "anon"` app-wide, replacing the vanilla
+app's per-call status checks. This is only safe because fastapi-users answers
+bad credentials with **400**, not 401 — so a failed login surfaces in the login
+form instead of being swallowed as "your session expired". A global handler
+built on the wrong status code would have silently converted every typo into a
+logout.
+
+**Design — the message model is parts from day one.**
+`Message = { role, parts: { kind, text }[] }`, matching both the NDJSON stream
+and `TranscriptResponse`, so a reloaded session renders identically to a live
+one. `applyLine()` is the whole protocol reduced into state in one switch:
+deltas merge into the trailing part when the kind matches and open a new part
+when it changes, `done` goes idle, `error` records a code, and unknown types are
+ignored by contract — which is what makes `tool_call` and `grounding` additive
+later rather than breaking changes.
+
+Thought parts render in a collapsed `<details>`. Present on demand, out of the
+way by default, and structurally incapable of being mistaken for the answer —
+the bug §4 spent a day chasing is now unrepresentable rather than merely fixed.
+
+**Design — streams outlive the view that started them.** A per-session
+`AbortController` registry, with a deliberately narrow abort policy: switching
+sessions does **not** abort. Aborting would disconnect the client mid-turn,
+Starlette would cancel the generator, and ADK would die mid-run — leaving the
+user's message persisted with no reply, which is a worse outcome than a reply
+the user didn't watch arrive. Only deleting the session being streamed into, or
+logging out, aborts. `selectSession` skips the transcript refetch while a
+session is streaming, because the server's transcript doesn't yet contain the
+in-flight turn and would clobber live state with a stale version of itself.
+
+**Design — Solid 2.0 avoidance, applied from the first file.** No
+`createResource`, `batch`, `on`, `createComputed`, or `produce` anywhere.
+`sendMessage` pushes the user turn and the empty assistant turn with a path
+setter rather than the `produce` draft that would read more naturally, on the
+grounds that the migration is smaller if the removed primitives were never
+adopted. The first draft of `chats.ts` used `produce` anyway; caught in review
+against the policy, not by the compiler.
+
+**Ported unchanged, because they were right:** resume-most-recent on entry,
+self-heal by creating a fresh session when a listed session 404s, "new chat"
+deliberately bypassing the resume policy, delete-current re-resolving through
+the same policy, patching the sidebar title in place from the title response
+rather than refetching, and rename committing on blur with Enter delegating to
+blur and Escape cancelling.
+
+That last one needed care. `<Show>` unmounts the input on Escape, and removing a
+focused element doesn't reliably fire `blur` across browsers — so cancellation
+is a plain instance variable, not a signal, read synchronously inside the blur
+handler it's racing. Nothing renders from it, so a signal would only buy
+re-renders nobody wants.
+
+**Two things the port fixed for free:**
+- The composer disables the entire form while streaming, closing the
+  double-submit gap the vanilla Send button left open (§6).
+- The stylesheet lost its `[hidden]` rules and the `#chat-view:not([hidden])`
+  workaround. That hack existed because an ID selector's `display: flex`
+  outranks `[hidden]`'s `display: none` regardless of rule order; `<Show>`
+  unmounts rather than hides, so the entire specificity fight is gone.
+
+**Bug found in the vanilla app while porting it:** §7 documents the title
+request and the chat request as "two independent, concurrent `fetch()` calls",
+and the whole `StaleSessionError` retry loop exists to absorb the write race
+between them. The code didn't do that. The title `fetch` sat *after* the
+streaming `try/finally`, so it only started once the stream had fully
+completed — strictly sequential, and the documented race was therefore mostly
+unreachable from this client. Ported as designed rather than as written: the
+title request now fires **before** the stream is awaited. Which means §7's retry
+loop stops being insurance against a hypothetical and starts earning its keep.
+
+**Finding — `erasableSyntaxOnly` bans constructor parameter properties.** The
+Vite template enables it, and `HttpError(readonly status: number)` — ordinary
+TypeScript, and the form every tutorial uses — fails to compile, because it's
+TS syntax that emits runtime code. Rewritten with explicit field declarations.
+Worth knowing before it bites again on enums and namespaces, which the flag also
+rejects.
+
+**Verified.** Fourteen assertions against the real `streamChat` and the real
+store, driven through mocked response bodies chunked adversarially: a body
+delivered one byte at a time parses identically to one delivered whole; a 4-byte
+emoji split across a chunk boundary survives (the case a hand-rolled
+`TextDecoder` turns into U+FFFD); an unterminated final line is flushed; blank
+lines are skipped; same-kind deltas merge while a kind change opens a new part;
+`done` goes idle, `error` records its code with prior text intact, and a stream
+ending with *neither* is marked interrupted; an unknown line type is ignored
+without derailing completion.
+
+Then the full sequence the components perform, against a live Hypercorn running
+the real ADK `Runner` with a scripted agent: register, login, list, create,
+title, stream (thought and text deltas, terminal `done`), transcript — returning
+the thought part alongside the answer — rename, list, delete, 404 on the deleted
+session's transcript (the self-heal trigger), logout, and 401 afterwards (the
+drop-to-anon trigger). The production build is served by FastAPI and loads.
+
+**Not verified, and worth saying plainly:** no browser ran this code. The
+sandbox has no headless browser, so component rendering, the auto-scroll effect,
+and the rename blur/Escape race are reasoned-through rather than observed. They
+are the first things to check by hand, and the first things the deferred test
+suite should cover.
+
+
 
 ## File Layout
 
