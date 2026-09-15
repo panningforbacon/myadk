@@ -732,8 +732,88 @@ adk-fastapi-demo/
 - Email verification / password reset routes exist in `fastapi-users` but are
   not mounted — deferred, not yet requested.
 
+
+# How to build & run
+
+Nothing here is optional except which of the two run modes you pick, and `.env` is the step that will bite you, since it's gitignored and the app boots without it.
+
+## 0. Prerequisites
+
+```bash
+node --version   # need ^20.19 or >=22.12 — Vite 8 refuses older
+uv --version
+```
+
+## 1. Clone and install
+
+```bash
+git clone <repo> && cd <repo>
+uv sync
+cd frontend && npm install && cd ..
+```
+
+## 2. Create `.env` (gitignored — it does not come with the clone)
+
+```bash
+cat > .env <<'EOF'
+GOOGLE_API_KEY=<your key>
+AUTH_SECRET=<any long random string>
+COOKIE_SECURE=false
+# DATABASE_URL defaults to sqlite+aiosqlite:///./database.db
+EOF
+```
+
+`COOKIE_SECURE` defaults to **true**. Omit that line and dev login fails silently over HTTP — the browser accepts the `Set-Cookie` and then refuses to send it back, so you get a clean 401 on the next request with nothing in the logs.
+
+## 3. Generate API types
+
+```bash
+cd frontend && npm run gen:api
+```
+
+Needed only if `src/api/schema.d.ts` is missing or the backend schema moved; `tsc` fails without it. Requires `uv` on PATH, since the script shells out to `uv run python`.
+
+## 4a. Dev — two terminals
+
+```bash
+# terminal 1
+uv run hypercorn app.main:app --bind 127.0.0.1:8000 --reload
+
+# terminal 2
+cd frontend && npm run dev
+```
+
+Open **http://localhost:5173**. Do not open `127.0.0.1:5173` — `localhost` and `127.0.0.1` are different sites, so the session cookie won't follow you between them.
+
+The backend logs `no frontend build at .../frontend/dist; serving API only` on startup. In dev that's correct and expected: Vite serves the UI and proxies `/api` through.
+
+## 4b. Prod-shaped — one process
+
+```bash
+cd frontend && npm run build && cd ..
+uv run hypercorn app.main:app --bind 0.0.0.0:8000
+```
+
+Open **http://localhost:8000**. Build *before* starting: the static mount is decided at import time, so a server started against an empty `dist/` stays API-only until you restart it.
+
+Behind HTTPS, drop `COOKIE_SECURE=false`.
+
+## 5. Verify
+
+```bash
+curl -s localhost:8000/api/health     # {"status":"pass"}
+curl -s localhost:8000/api/bogus      # {"detail":"not found"} — JSON, not HTML
+```
+
+Then register an account in the UI and send one message. You should see a collapsed "thinking" block above the reply; if the model returns no thought summary, that's flash-lite's thinking budget, not a bug.
+
+The database file is created on first boot. Delete `database.db` to start clean — it holds both your users and your chat sessions.
+
+A gitignored file is a file you will forget exists precisely once per machine.
+
+
+
 # Backlog
-- Rebuild front-end as a component'ized and reactive app (React or SolidJS)
 - Email verification of registrations
 - Password reset functionality
 - Superuser: Optionally view all users and access their sessions (as read-only)
