@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 FRONTEND_DIST = Path(__file__).resolve().parents[1] / "frontend" / "dist"
 FRONTEND_ASSETS = FRONTEND_DIST / "assets"
-FRONTEND_BUILT = (FRTONTEND_DIST / "index.html").is_file()
+FRONTEND_BUILT = (FRONTEND_DIST / "index.html").is_file()
 
 
 @asynccontextmanager
