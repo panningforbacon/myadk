@@ -700,6 +700,177 @@ are the first things to check by hand, and the first things the deferred test
 suite should cover.
 
 
+### 13. One writer per session
+
+*(Bug fix on top of §12, not a new iteration.)*
+
+**Symptom:** submitting the first message in a new session returned
+`{"type":"error","code":"stale_session"}`, and the *next* message came back
+answering both messages at once.
+
+**Root cause:** §12 moved the title request to fire before the stream is
+awaited, on the grounds that §7 documents the two calls as concurrent and the
+vanilla code ran them sequentially. The sequencing was load-bearing. The README
+was the wrong half.
+
+ADK's optimistic concurrency is per session, and the Runner holds the session
+snapshot it loaded at the start of a run:
+
+1. The Runner appends the user's message and keeps its snapshot.
+2. The title request calls `rename_session`, which **reloads** and appends the
+   title. It wins precisely because it reloads.
+3. The Runner finishes and appends the model's turn against its now-stale
+   snapshot. `StaleSessionError` → `ConcurrentUpdateError` → `error` line.
+4. The assistant turn is never persisted. The user's message is.
+5. The next turn replays session events as history, so the model receives two
+   consecutive user turns and answers both.
+
+The retry loop was on the wrong side of the race. `rename_session` retries and
+always wins; the stream cannot retry, because the Runner owns its own appends
+and the tokens are already on the wire. §7 armored the only participant that was
+never going to lose.
+
+**Fix — separate the slow part from the conflicting part.** Generation was never
+the problem; the *write* was. `/chat/stream` now starts `generate_title()` as a
+task before returning the response, so the title model and the chat model still
+overlap, and writes the result only after the run has finished appending. The
+title reaches the client as a new NDJSON line:
+
+```
+{"type":"text","delta":"Paris is the capital."}
+{"type":"title","title":"France questions"}
+{"type":"done"}
+```
+
+It carries `title`, not `delta`, because a name replaces rather than
+accumulates, and it arrives before `done`, so "exactly one terminal line" still
+holds. This is the first use of the forward-compatibility rule §10 designed:
+older clients ignore the line rather than breaking on it.
+
+**Deleted:** `POST /api/sessions/{id}/title` and its models,
+`core.maybe_generate_title`, `core.session_exists`, and the frontend's
+`api.generateTitle`. Read-check-generate-write was `maybe_generate_title`'s
+entire shape, and splitting the generate from the write is the whole fix, so
+nothing coherent was left of it.
+
+**Added:** `core.session_title()`, which replaces `session_exists`. The stream
+route needs to know both that the session is real — the last moment a 404 can
+still be a status code rather than an in-band error — and whether this turn
+should generate a title. One read answers both questions.
+
+**Two details that are easy to get wrong:**
+
+- A failed title must **not** emit `error`. The reply is already persisted, so
+  reporting a failed name as a failed turn would recreate the display/storage
+  disagreement this fix exists to remove. The title write sits in its own nested
+  `try`, logs, and falls through to `done`.
+- The task must be cancelled in a `finally`. On a client disconnect or a failed
+  run, nobody awaits it, and asyncio surfaces the unretrieved exception later
+  and somewhere unrelated.
+
+**Frontend:** `sendMessage` no longer knows what a first turn is — the server
+decides. `applyLine` takes `onTitle` as a parameter rather than importing
+`applyTitle`, since `sessions.ts` already imports `chats.ts` and reaching back
+would close the cycle. And on a `stale_session` line the transcript is now
+refetched: the reply on screen was never stored, and leaving it there is how the
+UI and the database end up disagreeing about what happened.
+
+**Verified** against the original repro on a live server with a scripted agent
+slow enough to hold the race window open: first turn emits `title` then `done`,
+a later turn emits no title line at all, and the transcript alternates
+`user, assistant, user, assistant` where it previously read
+`user, user, assistant`. A title agent that raises still produces a successful
+turn with the reply persisted and one logged failure. A client that hangs up
+mid-stream leaves no orphaned-task warning. Plus eight frontend assertions: the
+title line reaches the sidebar without being rendered into the transcript or
+terminating the stream, and a `stale_session` error resyncs the display to what
+the server actually stored while keeping the error state.
+
+**Unrelated, found while diagnosing:** the Ctrl+C traceback on Windows is
+Hypercorn's, not ours — every frame is in its supervisor process or CPython's
+`multiprocessing`. Ctrl+C interrupts `WaitForMultipleObjects`, and PEP 475's
+automatic EINTR retry doesn't cover `_winapi`, so `wait()` raises
+`InterruptedError` and Hypercorn doesn't catch it. The parent then dies without
+joining its workers, which can orphan a worker still holding the port. Running
+with `--workers 0` skips the multiprocessing supervisor entirely; it can't be
+combined with `--reload`, so keeping reload means driving restarts externally
+(e.g. `watchfiles`).
+
+
+### 14. Model failures are failures
+
+*(Bug fix on top of §13.)*
+
+**Symptom:** the third message in a session produced no reply and no error. On
+reload the message was there with nothing after it. The next message worked.
+
+**Root cause:** an ADK `Event` *is* an `LlmResponse`, so it carries
+`error_code`, `error_message`, and `finish_reason` alongside content. When a
+response is truncated, blocked, or filtered, the aggregator returns exactly
+that — and `content=None`:
+
+```python
+if finish_reason and finish_reason != types.FinishReason.STOP:
+    error_code = finish_reason
+...
+content = types.ModelContent(parts=parts) if parts else None
+```
+
+`_parts()` reads `content`, gets `None`, returns `[]`. `stream_message` yields
+nothing, `_ndjson` reaches the end of the loop without an exception, and emits
+`done`. **We told the client the turn succeeded**, logged nothing, and discarded
+the only record of what went wrong. The Runner had already persisted the user's
+message, so the transcript kept an orphaned user turn — and the *next* message
+got answered together with the failed one, which reads as a working app.
+
+That is §13's bug wearing a different hat: one failure mode was handled,
+`ConcurrentUpdateError`, and the code quietly assumed it was the only one.
+
+**Fix:** `ModelError` joins `SessionNotFoundError` and `ConcurrentUpdateError`.
+`stream_message` and `send_message` both check `event.error_code`, and
+`_ndjson` maps it to `{"type":"error","code":"model"}` — logging the finish
+reason at ERROR, because the client only ever sees the closed code set and the
+log is now the sole record of the cause.
+
+The failure is **recorded during the loop and raised after it**, which matters
+for two reasons. Text already streamed stays streamed: a reply truncated
+mid-sentence reaches the user followed by an error line, rather than vanishing.
+And raising from inside the `async for` tears down ADK's async generator
+mid-iteration, which unwinds its OpenTelemetry context managers in the wrong
+context — the first version of this fix produced five `Failed to detach context`
+tracebacks per failed turn, drowning the one log line the fix existed to
+produce. Letting the generator drain costs nothing, since an error event ends
+the invocation anyway.
+
+**Frontend:** `"model"` joins the error union, and `Transcript` now picks its
+message from `errorCode` rather than showing one generic line for every failure.
+`errorCode` had been stored since §12 and displayed by nobody, which is its own
+small lesson — the codes mean different things to a user: retry, reload, or give
+up.
+
+**Why the third message?** Unknown, and that was the point: nothing recorded it.
+The pattern rules out anything persistent, since the fourth message succeeded
+against a *larger* history — so not thought signatures, not corrupted history.
+The leading suspect is `MAX_TOKENS`: §9 enabled `include_thoughts`, thinking
+tokens count against the output limit, and thinking grows with conversation
+length. Safety blocks and transient 5xxs produce an identical shape. The server
+log now names which.
+
+**Still open:** a failed turn leaves the user's message in history with no reply,
+so the next message is answered together with it. Writing a placeholder
+assistant event would keep history alternating, at the cost of the model seeing
+a record of its own failure in context. Deliberate decision, not yet made.
+
+**Verified** with a scripted agent whose third turn returns ADK's exact failure
+shape: before, four turns produced `text, done / text, done / done / text, done`
+and a transcript reading `user, assistant, user, assistant, user, user,
+assistant`. After, the third turn emits `error/model`, the log names
+`MAX_TOKENS: exceeded the output token limit`, and no OpenTelemetry noise
+appears. Also verified directly against `core`: a truncated response yields its
+partial text *then* raises; a response with no content at all raises the same
+way; a clean turn raises nothing; and `/chat`'s non-streaming path is covered
+too.
+
 
 ## File Layout
 

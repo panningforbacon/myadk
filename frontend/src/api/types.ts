@@ -16,5 +16,7 @@ export type PartKind = PartOut["kind"];
 export type StreamLine =
   | { type: "text"; delta: string }
   | { type: "thought"; delta: string }
-  | { type: "error"; code: "stale_session" | "internal" }
+  // Carries `title`, not `delta`: a name replaces, it doesn't accumulate.
+  | { type: "title"; title: string }
+  | { type: "error"; code: "stale_session" | "model" | "internal" }
   | { type: "done" };

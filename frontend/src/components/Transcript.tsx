@@ -3,10 +3,20 @@ import { createEffect, For, Show } from "solid-js";
 import { chats } from "../state/chats";
 import Message from "./Message";
 
-const STATUS_NOTE: Record<string, string> = {
-  error: "Something went wrong -- see console.",
-  interrupted: "The reply was cut off before it finished.",
+/** errorCode has been stored since commit D and displayed by nobody. The codes
+ * mean genuinely different things to a user -- retry, reload, or give up. */
+const ERROR_NOTE: Record<string, string> = {
+  model: "The model didn't finish this reply. Try again.",
+  stale_session: "That reply was lost to a conflicting write and wasn't saved.",
+  network: "The connection failed.",
+  internal: "Something went wrong on the server.",
 };
+
+function note(status: string | undefined, errorCode: string | undefined): string | undefined {
+  if (status === "interrupted") return "The reply was cut off before it finished.";
+  if (status === "error") return ERROR_NOTE[errorCode ?? ""] ?? "Something went wrong.";
+  return undefined;
+}
 
 export default function Transcript(props: { sessionId: string }) {
   let el!: HTMLDivElement;
@@ -22,7 +32,7 @@ export default function Transcript(props: { sessionId: string }) {
   return (
     <div id="transcript" ref={el} aria-live="polite">
       <For each={chat()?.messages ?? []}>{(message) => <Message message={message} />}</For>
-      <Show when={STATUS_NOTE[chat()?.status ?? ""]}>
+      <Show when={note(chat()?.status, chat()?.errorCode)}>
         {(note) => <p class="error">{note()}</p>}
       </Show>
     </div>

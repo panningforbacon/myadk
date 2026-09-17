@@ -44,12 +44,20 @@ function appendDelta(sessionId: string, kind: PartKind, delta: string): void {
   }
 }
 
-/** The whole wire protocol, reduced into state, in one place. */
-export function applyLine(sessionId: string, line: StreamLine): void {
+/** The whole wire protocol, reduced into state, in one place.
+ *
+ * onTitle is a parameter rather than an import: sessions.ts already imports
+ * this module, so reaching back for applyTitle would close the cycle. */
+export function applyLine(sessionId: string, line: StreamLine, onTitle: (id: string, title: string) => void): void {
   switch (line.type) {
     case "text":
     case "thought":
       appendDelta(sessionId, line.type, line.delta);
+      break;
+    case "title":
+      // The server names the session now, so this arrives mid-stream rather
+      // than from a second request racing this one.
+      onTitle(sessionId, line.title);
       break;
     case "done":
       setChats(sessionId, "status", "idle");
@@ -84,33 +92,29 @@ export function abortAll(): void {
 
 export async function sendMessage(sessionId: string, message: string, onTitle: (id: string, title: string) => void): Promise<void> {
   ensureChat(sessionId);
-  const isFirstTurn = chats[sessionId].messages.length === 0;
 
   // Path setters rather than produce(): Solid 2.0 removes produce, and the
   // migration is smaller if it was never adopted.
   setChats(sessionId, "messages", (messages) => [...messages, { role: "user", parts: [{ kind: "text" as const, text: message }] }, { role: "assistant", parts: [] }]);
   setChats(sessionId, { status: "streaming", errorCode: undefined });
 
-  if (isFirstTurn) {
-    // Fired before the stream is awaited, not after it: the two requests are
-    // meant to race, which is precisely what rename_session's retry loop exists
-    // to absorb. Never awaited -- a slow or failed title must not touch the reply.
-    void api
-      .generateTitle(sessionId, message)
-      .then(({ title }) => onTitle(sessionId, title))
-      .catch((err) => console.error("title generation failed:", err));
-  }
-
   const controller = new AbortController();
   inflight.set(sessionId, controller);
 
   try {
     for await (const line of streamChat(sessionId, message, controller.signal)) {
-      applyLine(sessionId, line);
+      applyLine(sessionId, line, onTitle);
     }
     // Neither done nor error arrived: the connection died mid-turn. The only
     // reason the client can tell this apart from a finished reply.
     if (chats[sessionId].status === "streaming") setChats(sessionId, "status", "interrupted");
+
+    if (chats[sessionId].errorCode === "stale_session") {
+      // The reply on screen was never persisted. Refetching is the only way the
+      // display and the stored history agree about what happened.
+      await loadTranscript(sessionId);
+      setChats(sessionId, { status: "error", errorCode: "stale_session" }); // loadTranscript clears both
+    }
   } catch (err) {
     if (controller.signal.aborted) return;
     console.error(err);

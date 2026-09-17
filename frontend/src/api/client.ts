@@ -52,7 +52,6 @@ export const api = {
   deleteSession: (id: string) => apiFetch(`/sessions/${id}`, { method: "DELETE" }),
   renameSession: (id: string, title: string) => apiFetch(`/sessions/${id}`, { method: "PATCH", ...json({ title }) }),
   transcript: (id: string) => apiJson<{ turns: import("./types").TurnOut[] }>(`/sessions/${id}/messages`),
-  generateTitle: (id: string, message: string) => apiJson<{ title: string }>(`/sessions/${id}/title`, { method: "POST", ...json({ message }) }),
 
   login: (email: string, password: string) => apiFetch("/auth/login", { method: "POST", ...form({ username: email, password }) }),
   register: (email: string, password: string) => apiFetch("/auth/register", { method: "POST", ...json({ email, password }) }),

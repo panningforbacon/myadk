@@ -35,12 +35,21 @@ class ConcurrentUpdateError(Exception):
     """A session write lost ADK's optimistic-concurrency check and couldn't be retried."""
 
 
+class ModelError(Exception):
+    """The model returned a failure instead of a reply."""
+
+
 PartKind = Literal["text", "thought"]
 
 
 @dataclass(frozen=True)
 class TurnPart:
-    """One text-bearing piece of a model turn, tagged with what kind it is."""
+    """One text-bearing piece of a model turn, tagged with what kind it is.
+
+    The model interleaves its reasoning summary with its answer in a single
+    Content; keeping the tag instead of discarding thoughts is what lets the UI
+    render them separately rather than either hiding or mixing them.
+    """
 
     kind: PartKind
     text: str
@@ -88,18 +97,26 @@ async def delete_session(user_id: str, session_id: str) -> None:  # raises Sessi
 
 
 def _parts(content: types.Content | None) -> list[TurnPart]:
-    """Every text-bearing part, in order, tagged thought-or-answer."""
+    """Every text-bearing part, in order, tagged thought-or-answer.
+
+    Non-text parts (function calls, inline data) are dropped: nothing downstream
+    can render them yet, and silently stringifying them would be worse.
+    """
     if not content or not content.parts:
         return []
     return [TurnPart(kind="thought" if part.thought else "text", text=part.text) for part in content.parts if part.text]
 
 
 def _answer_text(content: types.Content | None) -> str:
-    """The answer alone, thoughts excluded, concatenated across parts."""
+    """The answer alone, thoughts excluded, concatenated across parts.
+
+    Concatenation matters: a response split across several text parts used to
+    lose everything after the first.
+    """
     return "".join(part.text for part in _parts(content) if part.kind == "text")
 
 
-async def get_transcript(user_id: str, session_id: str) -> list[Turn]:
+async def get_transcript(user_id: str, session_id: str) -> list[Turn]:  # raises SessionNotFoundError
     session = await session_service.get_session(app_name=APP_NAME, user_id=user_id, session_id=session_id)
     if session is None:
         raise SessionNotFoundError(f"no session {session_id!r} for user {user_id!r}")
@@ -117,29 +134,20 @@ async def get_transcript(user_id: str, session_id: str) -> list[Turn]:
     return turns
 
 
-async def session_exists(user_id: str, session_id: str) -> bool:
-    session = await session_service.get_session(app_name=APP_NAME, user_id=user_id, session_id=session_id)
-    return session is not None
+async def session_title(user_id: str, session_id: str) -> str | None:  # raises SessionNotFoundError
+    """The session's title, or None if it has never been named.
 
-
-async def maybe_generate_title(user_id: str, session_id: str, first_message: str) -> str:
+    Replaces the old existence check: /chat/stream needs to know both that the
+    session is real (the last moment a 404 can still be a status code) and
+    whether this turn should generate a title, and one read answers both.
+    """
     session = await session_service.get_session(app_name=APP_NAME, user_id=user_id, session_id=session_id)
     if session is None:
         raise SessionNotFoundError(f"no session {session_id!r} for user {user_id!r}")
-
-    current_title = session.state.get("title")
-    if current_title:
-        return current_title
-
-    title = await generate_title(first_message)
-    if not title:
-        title = DEFAULT_TITLE
-
-    await rename_session(user_id, session_id, title)
-    return title
+    return session.state.get("title")
 
 
-async def rename_session(user_id: str, session_id: str, title: str) -> None:
+async def rename_session(user_id: str, session_id: str, title: str) -> None:  # raises SessionNotFoundError, ConcurrentUpdateError
     """Write the title, reloading and retrying if a concurrent writer beat us."""
 
     for attempt in range(1, RENAME_ATTEMPTS + 1):
@@ -171,8 +179,13 @@ async def generate_title(first_message: str) -> str:
         await session_service.delete_session(app_name=TITLE_APP_NAME, user_id=title_user_id, session_id=session.id)
 
 
-async def stream_message(user_id: str, session_id: str, message: str) -> AsyncIterator[StreamEvent]:
-    """Yield each delta once, whether or not the model streamed it."""
+async def stream_message(user_id: str, session_id: str, message: str) -> AsyncIterator[StreamEvent]:  # raises SessionNotFoundError, ConcurrentUpdateError
+    """Yield each delta once, whether or not the model streamed it.
+
+    SSE mode emits partial deltas and then a non-partial aggregate repeating all
+    of them, per LLM call. Yielding both would duplicate the turn; yielding only
+    partials would drop any call that produced none.
+    """
 
     session = await session_service.get_session(app_name=APP_NAME, user_id=user_id, session_id=session_id)
     if session is None:
@@ -182,6 +195,7 @@ async def stream_message(user_id: str, session_id: str, message: str) -> AsyncIt
     run_config = RunConfig(streaming_mode=StreamingMode.SSE)
 
     awaiting_aggregate = False
+    failure = None
     try:
         async for event in runner.run_async(user_id=user_id, session_id=session_id, new_message=user_message, run_config=run_config):
             if event.partial:
@@ -197,11 +211,20 @@ async def stream_message(user_id: str, session_id: str, message: str) -> AsyncIt
                 # Reset per LLM call, not per invocation: a tool call splits one
                 # turn into several, each with its own partials-then-aggregate.
                 awaiting_aggregate = False
+
+            # Recorded, not raised: text already streamed is worth keeping, and
+            # raising here would tear down ADK's generator mid-iteration, which
+            # unwinds its telemetry contexts wrongly and floods the log.
+            if event.error_code and failure is None:
+                failure = f"{event.error_code}: {event.error_message}"
     except StaleSessionError as err:
         raise ConcurrentUpdateError(f"lost a write race mid-stream on session {session_id!r}") from err
 
+    if failure:
+        raise ModelError(failure)
 
-async def send_message(user_id: str, session_id: str, message: str) -> str:  # raises SessionNotFoundError
+
+async def send_message(user_id: str, session_id: str, message: str) -> str:  # raises SessionNotFoundError, ConcurrentUpdateError
     session = await session_service.get_session(app_name=APP_NAME, user_id=user_id, session_id=session_id)
     if session is None:
         raise SessionNotFoundError(f"no session {session_id!r} for user {user_id!r}")
@@ -209,11 +232,17 @@ async def send_message(user_id: str, session_id: str, message: str) -> str:  # r
     user_message = types.Content(role="user", parts=[types.Part(text=message)])
 
     final_text = ""
+    failure = None
     try:
         async for event in runner.run_async(user_id=user_id, session_id=session_id, new_message=user_message):
+            if event.error_code and failure is None:
+                failure = f"{event.error_code}: {event.error_message}"
             if event.is_final_response():
                 final_text = _answer_text(event.content)
     except StaleSessionError as err:
         raise ConcurrentUpdateError(f"lost a write race on session {session_id!r}") from err
+
+    if failure:
+        raise ModelError(failure)
 
     return final_text

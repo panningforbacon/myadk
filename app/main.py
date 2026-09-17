@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 from collections.abc import AsyncIterator
@@ -81,14 +82,6 @@ class RenameSessionRequest(BaseModel):
     title: str
 
 
-class TitleRequest(BaseModel):
-    message: str
-
-
-class TitleResponse(BaseModel):
-    title: str
-
-
 class PartOut(BaseModel):
     kind: Literal["text", "thought"]
     text: str
@@ -112,12 +105,17 @@ def _line(payload: dict) -> str:
     return json.dumps(payload, ensure_ascii=False) + "\n"
 
 
-async def _ndjson(events: AsyncIterator[core.StreamEvent]) -> AsyncIterator[str]:
+async def _ndjson(events: AsyncIterator[core.StreamEvent], user_id: str, session_id: str, title_task: asyncio.Task[str] | None) -> AsyncIterator[str]:
     """Serialize typed events, always terminating with exactly one done-or-error.
 
     A stream ending with neither is how the client learns it was cut off -- the
     one thing text/plain could never distinguish from success. Failures after
     this point can't be status codes; the 200 went out with the first chunk.
+
+    The title is written here, after the run has finished appending, because
+    ADK's optimistic concurrency is per session: two writers racing means one
+    of them loses its whole turn. Generation ran concurrently; only the write
+    is serialized.
     """
     try:
         async for event in events:
@@ -128,15 +126,37 @@ async def _ndjson(events: AsyncIterator[core.StreamEvent]) -> AsyncIterator[str]
                     # StreamEvent is a union built to widen. Dropping a new
                     # member silently would be near-undebuggable client-side.
                     logger.error(f"unserializable stream event: {event!r}")
+
+        if title_task is not None:
+            try:
+                title = (await title_task).strip() or core.DEFAULT_TITLE
+                await core.rename_session(user_id, session_id, title)
+                yield _line({"type": "title", "title": title})
+            except Exception:
+                # Non-fatal by construction: the reply is already persisted, so
+                # reporting a failed title as a failed turn would be a lie.
+                logger.exception("title generation failed")
+
         yield _line({"type": "done"})
     except core.ConcurrentUpdateError:
         logger.warning("lost a write race mid-turn")
         yield _line({"type": "error", "code": "stale_session"})
+    except core.ModelError:
+        # Logged with the finish reason, because the client only ever sees the
+        # closed code set and this is the sole record of what actually happened.
+        logger.exception("model returned a failure instead of a reply")
+        yield _line({"type": "error", "code": "model"})
     except Exception:
         # CancelledError is a BaseException, so a client disconnect propagates
         # past this rather than being reported to nobody as a server fault.
         logger.exception("stream failed")
         yield _line({"type": "error", "code": "internal"})
+    finally:
+        # A disconnect or a failed run leaves this task running with nobody to
+        # retrieve its exception, which asyncio then complains about later and
+        # elsewhere.
+        if title_task is not None and not title_task.done():
+            title_task.cancel()
 
 
 @api.get("/health", response_model=HealthResponse)
@@ -194,25 +214,22 @@ async def chat(req: ChatRequest, user: User = Depends(current_active_user)) -> C
 
 @api.post("/chat/stream")
 async def chat_stream(req: ChatRequest, user: User = Depends(current_active_user)):
+    user_id = str(user.id)
     # The last point where a missing session can still be a status code: once
     # StreamingResponse sends headers, 200 is already committed.
-    if not await core.session_exists(str(user.id), req.session_id):
-        raise HTTPException(status_code=404, detail="session not found")
-    return StreamingResponse(
-        _ndjson(core.stream_message(str(user.id), req.session_id, req.message)),
-        media_type=NDJSON_MEDIA_TYPE,
-    )
-
-
-@api.post("/sessions/{session_id}/title", response_model=TitleResponse)
-async def generate_session_title(session_id: str, req: TitleRequest, user: User = Depends(current_active_user)) -> TitleResponse:
     try:
-        title = await core.maybe_generate_title(str(user.id), session_id, req.message)
+        title = await core.session_title(user_id, req.session_id)
     except core.SessionNotFoundError as err:
         raise HTTPException(status_code=404, detail="session not found") from err
-    except core.ConcurrentUpdateError as err:
-        raise HTTPException(status_code=409, detail="session was being written concurrently") from err
-    return TitleResponse(title=title)
+
+    # Started here rather than after the run so the title model and the chat
+    # model overlap; by the time the reply finishes, this is usually done.
+    title_task = None if title else asyncio.create_task(core.generate_title(req.message))
+
+    return StreamingResponse(
+        _ndjson(core.stream_message(user_id, req.session_id, req.message), user_id, req.session_id, title_task),
+        media_type=NDJSON_MEDIA_TYPE,
+    )
 
 
 # include_router copies routes at call time, so this must come after every
@@ -252,6 +269,5 @@ class HashedAssetFiles(StaticFiles):
 # index.html for directory paths -- it is not an SPA fallback, and Starlette
 # answers unmatched non-directory paths with 404. Nothing needs one yet: the
 # app has no client-side routing.
-
 if FRONTEND_BUILT:
     app.mount("/", HashedAssetFiles(directory=FRONTEND_DIST, html=True), name="static")
