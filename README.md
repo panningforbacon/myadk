@@ -871,6 +871,132 @@ partial text *then* raises; a response with no content at all raises the same
 way; a clean turn raises nothing; and `/chat`'s non-streaming path is covered
 too.
 
+## Iteration Plan for the Solid-JS Frontend
+
+### Commit A: backend correctness (vanilla UI still works)
+
+1. **Shared part extractors in `core.py`.**
+   - `_parts(content) -> list[TurnPart]` returns every text-bearing part as `TurnPart(kind: Literal["text","thought"], text)`.
+   - `_answer_text(content)` becomes the joined non-thought text.
+   - `generate_title`, `send_message`, and `get_transcript` all use them, so no `parts[0]` reads remain.
+2. **Core stream events.** Add frozen dataclasses `TextDelta(text)` and `ThoughtDelta(text)` with `type StreamEvent = TextDelta | ThoughtDelta`. `stream_message` returns `AsyncIterator[StreamEvent]`.
+   - This ends the README's "zero signature changes" streak, deliberately. Record that in the history.
+3. **Rewrite the `stream_message` loop around one invariant.** SSE mode sends partial deltas, then a non-partial aggregate that repeats them.
+
+   ```python
+   awaiting_aggregate = False
+   async for event in runner.run_async(...):
+       if event.partial:
+           for delta in _deltas(event.content):
+               awaiting_aggregate = True
+               yield delta
+       else:
+           if not awaiting_aggregate:  # no partials preceded it: this is the only delivery
+               for delta in _deltas(event.content):
+                   yield delta
+           awaiting_aggregate = False
+   ```
+
+   - This replaces the dead fallback and resets per LLM call rather than per invocation. The old `yielded_any` would break once a tool call separates two model turns.
+   - Confirm the aggregate behavior against the installed `google/adk/utils/streaming_utils.py` rather than my memory.
+4. **Core-domain error for write races.** Add `class ConcurrentUpdateError(Exception)` beside `SessionNotFoundError`. `core.py` translates `StaleSessionError` into it, so `main.py` never imports `google.adk`.
+   - `stream_message` lets it propagate. There is no graceful swallow anymore.
+5. **Actually implement the retry in `rename_session`.** Make 3 attempts, each reloading the session before `append_event`; when all fail, raise `ConcurrentUpdateError`.
+6. **Transcript returns parts.** `Turn` becomes `Turn(role, parts: list[TurnPart])`, so a reloaded session renders the same as a live one.
+7. **Enable thoughts on `root_agent`.** Set `include_thoughts=True` on `root_agent` only, not `title_agent`. Older ADK rejected `thinking_config` inside `generate_content_config` and required `BuiltInPlanner(thinking_config=...)`, so use whichever 2.8 accepts.
+8. **Housekeeping.** Switch to the public `StreamingMode` import and fix pyright's `include = ["app"]`.
+9. **Keep `/chat/stream` on `text/plain` for this commit.** It joins only `TextDelta`s, which keeps the vanilla UI alive until commit D.
+
+### Commit B: wire, routes, security (vanilla UI breaks here, on purpose)
+
+1. **Move everything under `api = APIRouter(prefix="/api")`,** including fastapi-users at `/api/auth` and health at `/api/health`.
+   - Call `app.include_router(api)` at the bottom, just before the static mount. `include_router` copies routes at call time, so anything added to `api` afterward silently doesn't exist.
+2. **NDJSON adapter in `main.py`.** Serialize with a `match` over the dataclasses (structural pattern matching, the idiom) and append `done`.
+   - `except core.ConcurrentUpdateError` emits `stale_session`.
+   - `except Exception` logs the traceback and emits `internal`.
+   - Client disconnects raise `CancelledError`, which subclasses `BaseException`, so `except Exception` correctly lets cancellation through.
+3. **Status codes.** PATCH rename and POST title map `ConcurrentUpdateError` to 409.
+4. **Keep the pre-stream `session_exists` check,** with a why-comment: it's the only point where a 404 can still be a status code.
+5. **Origin check in `app/security.py`, as pure ASGI middleware.** Use pure ASGI rather than `@app.middleware("http")` so it never wraps the stream.
+   - Unsafe methods only.
+   - If `Origin` is absent, allow the request; non-browser clients don't send it, and CSRF needs a browser.
+   - If `Origin`'s netloc doesn't equal `Host`, including `"null"`, return a 403 JSON response.
+6. **Cookies in `users.py`.** Set `cookie_samesite="lax"` explicitly. Set `cookie_secure = os.environ.get("COOKIE_SECURE", "true").lower() != "false"`, which defaults to secure; put `COOKIE_SECURE=false` in `.env`.
+
+### Commit C: pipeline
+
+1. **Scaffold** with `npm create vite@latest frontend -- --template solid-ts` at the repo root.
+   - Then pin `solid-js@~1.9` and `vite-plugin-solid@^2` explicitly.
+   - Pin Vite to whatever the plugin's peer range admits.
+   - Check that the template didn't hand you 2.0 RC, and check the Node version Vite requires.
+2. **`vite.config.ts` proxy:** `"/api": { target: "http://127.0.0.1:8000", changeOrigin: false }`.
+   - `changeOrigin: false` carries a why-comment: most copy-pasted examples set it to `true`, which rewrites `Host` and silently breaks the Origin check.
+3. **`.gitignore`:** add `frontend/node_modules` and `frontend/dist`.
+4. **Static mount in `main.py`.** Compute `FRONTEND_DIST = Path(__file__).resolve().parents[1] / "frontend" / "dist"`, which also fixes today's dependence on the working directory.
+   - Mount only if `index.html` exists.
+   - Log the "not built, API-only" warning from inside `lifespan`, because a module-level log would fire before `configure_logging` runs.
+   - Replace the wrong `html=True` comment. There's no client-side routing this iteration, so no SPA fallback is needed.
+5. **Cache headers.** Subclass `StaticFiles` and override `file_response`.
+   - `/assets/*` gets `public, max-age=31536000, immutable`.
+   - Everything else gets `no-cache`.
+   - Verify the override signature against the installed Starlette.
+6. **`npm run gen:api`.** Dump `app.openapi()` via `uv run python -c ...` without running the server, then run `openapi-typescript` to produce `src/api/schema.d.ts`, committed. This is the one cuttable step if the iteration balloons.
+
+### Commit D: UI parity plus thought rendering
+
+1. **`api/client.ts`:** `apiFetch` adds the `/api` prefix.
+   - A 401 sets auth to `"anon"` and throws.
+   - Other non-OK responses throw `HttpError`.
+   - Login stays form-encoded. Bad credentials come back as 400, not 401, so the global handler never eats login-form errors.
+2. **`api/stream.ts`:** `streamChat(sessionId, message, signal): AsyncGenerator<StreamLine>`.
+   - Pipe through `TextDecoderStream`, which handles multibyte characters split across chunks.
+   - Buffer text and split on `\n`, carrying the partial tail forward.
+   - Flush the tail at EOF and skip blank lines.
+3. **State.** Use signals and stores only. Avoid `createResource`, `batch`, `produce`, `on`, and `createMutable`, all of which Solid 2.0 removes; it shrinks the future migration for free.
+   - **`auth.ts`:** a signal holding `"unknown" | "anon" | "authed"`.
+   - **`sessions.ts`:** `{ list, currentId }`, porting the vanilla policies unchanged: resume the most recent session, self-heal on a 404, "new chat" bypasses resume, and deleting the current session re-resolves.
+   - **`chats.ts`:** `Record<sessionId, { messages: Message[]; status: "idle"|"loading"|"streaming"|"error"|"interrupted"; errorCode? }>`, where `Message = { role, parts: { kind, text }[] }`.
+   - **`applyLine` reducer:**
+     - A delta appends to the last part if the kind matches; otherwise it pushes a new part.
+     - `done` sets status to `idle`, `error` sets `error`, and unknown types are ignored.
+     - If the loop ends while status is still `streaming`, set `interrupted`.
+4. **In-flight streams.** Keep a per-session `AbortController` registry.
+   - Switching sessions does *not* abort; the stream finishes into its own session's state.
+   - Deleting that session or logging out does abort.
+   - Transcript refetch on select is skipped while that session is streaming.
+5. **Components:** `App` (a `<Switch>` on auth), `AuthView`, `ChatView`, `Sidebar`, `SessionItem` (port the Enter/Escape/blur rename semantics exactly), `Transcript` (effect-driven auto-scroll), `Message`, and `Composer`.
+   - `Message` renders thought parts in a collapsed `<details>`.
+   - `Composer` disables the whole form while streaming, closing the §6 Send-button gap.
+   - The first-turn `/title` call stays concurrent and un-awaited, and a 409 is ignored.
+6. **Port `style.css` as global CSS** and drop the `[hidden]`/`:not([hidden])` rules. `<Show>` unmounts elements instead of toggling `hidden`, so that specificity bug class disappears.
+7. **Cleanup.** Delete `app/static/`, then update README File Layout, Open Items, and Backlog: Solid 2.0 migration, markdown rendering, tool and grounding events, prod topology. Correct the stale §4 and §7 claims.
+
+### Verification
+
+**Backend, with a fake-agent rig in the same style as §4 and §7:**
+
+- Thought and text partials followed by an aggregate produce deltas plus `done`, with no duplicated aggregate.
+- A lone non-partial event emits its content exactly once.
+- A stale-session failure mid-stream produces deltas, then `error: stale_session`, and no `done`.
+- A generic exception produces `internal` with no exception text on the wire.
+- Rename that goes stale twice then succeeds persists the title. Stale three times returns 409.
+- The transcript includes thought parts.
+- The Origin middleware returns 403 on a mismatch, 200 on a match, and passes requests with no Origin and all GETs.
+- `COOKIE_SECURE` unset puts `Secure` on the cookie; `false` omits it.
+
+**Pipeline, by hand:**
+
+- Log in with `curl -c jar` through `:5173`, then `curl -N -b jar` against `/api/chat/stream` and confirm lines arrive incrementally rather than in one burst.
+- Make a real Gemini call and confirm thought lines appear, or record that flash-lite emits none.
+- Run `npm run build`, then Hypercorn alone, and check the cache headers on `/` and on an asset.
+- Kill Hypercorn mid-reply and confirm the UI shows "interrupted".
+- Submit a form from `python -m http.server 9000` to `localhost:8000/api/sessions` and confirm a 403.
+
+### Deferred, because there's no prod target yet
+
+- **Topology-dependent:** `X-Accel-Buffering: no`, a `__Host-` cookie prefix, HTTPS, and a container build.
+- **The only designed-in change point:** if prod ever becomes sibling subdomains, the Origin check switches from Host-equality to an allowlist. Nothing else in this plan moves.
+
 
 ## File Layout
 
